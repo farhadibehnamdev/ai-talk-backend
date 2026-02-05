@@ -1,7 +1,15 @@
 """
-ASR (Automatic Speech Recognition) Service using Kyutai Moshi STT.
+ASR (Automatic Speech Recognition) Service using Kyutai STT.
 
-This service handles real-time speech-to-text conversion for the AI-Talk application.
+This service handles real-time speech-to-text conversion using the
+kyutai/stt-2.6b-en model for the AI-Talk application.
+
+Model: https://huggingface.co/kyutai/stt-2.6b-en
+- 2.6B parameters
+- English-only
+- 2.5 second streaming delay
+- Robust to noisy conditions
+- Produces transcripts with capitalization and punctuation
 """
 
 import asyncio
@@ -24,29 +32,43 @@ class TranscriptionResult:
     is_final: bool
     confidence: float = 1.0
     language: str = "en"
+    timestamp_start: Optional[float] = None
+    timestamp_end: Optional[float] = None
 
 
 class ASRService:
     """
-    Automatic Speech Recognition service using Kyutai Moshi STT.
+    Automatic Speech Recognition service using Kyutai STT.
 
     This service provides:
     - Audio preprocessing and format conversion
     - Real-time streaming transcription
     - Batch transcription for complete audio files
+
+    Hardware Requirements:
+    - ~6-8 GB VRAM for the 2.6B model
+    - CUDA 12.1+ recommended
     """
 
     def __init__(self):
         """Initialize the ASR service."""
         self._model = None
-        self._processor = None
+        self._mimi = None  # Mimi audio tokenizer
+        self._text_tokenizer = None
         self._device = None
+        self._dtype = None
         self._is_loaded = False
         self._lock = asyncio.Lock()
+        self._use_transformers = False  # Flag to track which backend is used
 
         # Audio configuration
         self.sample_rate = settings.asr_sample_rate  # 16000 Hz expected
         self.chunk_duration_ms = settings.audio_chunk_ms
+        self.stream_delay_ms = settings.asr_stream_delay_ms  # 2500ms for 2.6b model
+
+        # Model configuration
+        self.model_name = settings.asr_model_name
+        self.cache_dir = settings.models_cache_dir
 
     @property
     def is_loaded(self) -> bool:
@@ -65,14 +87,17 @@ class ASRService:
                 logger.debug("ASR model already loaded, skipping")
                 return
 
-            logger.info(f"Loading ASR model: {settings.asr_model_name}")
+            logger.info(f"Loading ASR model: {self.model_name}")
 
             try:
-                # Determine device
+                # Determine device and dtype
                 self._device = torch.device(
-                    "cuda" if torch.cuda.is_available() else "cpu"
+                    settings.asr_device
+                    if settings.asr_device
+                    else ("cuda" if torch.cuda.is_available() else "cpu")
                 )
-                logger.info(f"ASR using device: {self._device}")
+                self._dtype = getattr(torch, settings.asr_dtype, torch.float16)
+                logger.info(f"ASR using device: {self._device}, dtype: {self._dtype}")
 
                 # Load model in a thread pool to avoid blocking
                 loop = asyncio.get_event_loop()
@@ -87,23 +112,124 @@ class ASRService:
 
     def _load_model_sync(self) -> None:
         """Synchronous model loading (runs in thread pool)."""
+        # Try multiple loading strategies in order of preference
+
+        # Strategy 1: Try native transformers (>= 4.53.0)
+        if self._try_load_transformers():
+            return
+
+        # Strategy 2: Try Moshi library
+        if self._try_load_moshi():
+            return
+
+        # Strategy 3: Fallback to Whisper for development
+        logger.warning("Primary ASR models not available, using Whisper fallback")
+        self._load_whisper_fallback()
+
+    def _try_load_transformers(self) -> bool:
+        """Try loading with native transformers support (>= 4.53.0)."""
         try:
-            # Try to load Kyutai Moshi ASR
-            # Note: The actual import may vary based on Moshi's API
-            # This is a placeholder that should be updated based on actual Moshi documentation
+            import transformers
+            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+
+            # Check transformers version
+            version = tuple(map(int, transformers.__version__.split(".")[:2]))
+            if version < (4, 53):
+                logger.info(
+                    f"Transformers {transformers.__version__} < 4.53.0, skipping native loading"
+                )
+                return False
+
+            logger.info("Attempting to load Kyutai STT with native transformers...")
+
+            # For transformers >= 4.53.0, use the -trfs variant
+            model_name = self.model_name
+            if not model_name.endswith("-trfs"):
+                # Try the transformers-native variant
+                trfs_model = model_name.replace("stt-", "stt-").rstrip("/") + "-trfs"
+                try:
+                    self._processor = AutoProcessor.from_pretrained(
+                        trfs_model,
+                        cache_dir=self.cache_dir,
+                        trust_remote_code=settings.trust_remote_code,
+                    )
+                    self._model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                        trfs_model,
+                        torch_dtype=self._dtype,
+                        cache_dir=self.cache_dir,
+                        trust_remote_code=settings.trust_remote_code,
+                    ).to(self._device)
+                    self._use_transformers = True
+                    logger.info(f"Loaded Kyutai STT with transformers: {trfs_model}")
+                    return True
+                except Exception as e:
+                    logger.debug(f"Could not load -trfs variant: {e}")
+
+            # Try loading original model with transformers
+            self._processor = AutoProcessor.from_pretrained(
+                model_name,
+                cache_dir=self.cache_dir,
+                trust_remote_code=settings.trust_remote_code,
+            )
+            self._model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_name,
+                torch_dtype=self._dtype,
+                cache_dir=self.cache_dir,
+                trust_remote_code=settings.trust_remote_code,
+            ).to(self._device)
+            self._use_transformers = True
+            logger.info(f"Loaded Kyutai STT with transformers: {model_name}")
+            return True
+
+        except ImportError as e:
+            logger.debug(f"Transformers import error: {e}")
+            return False
+        except Exception as e:
+            logger.debug(f"Failed to load with transformers: {e}")
+            return False
+
+    def _try_load_moshi(self) -> bool:
+        """Try loading with Moshi library."""
+        try:
+            # Import moshi components
+            import sentencepiece
+            from huggingface_hub import hf_hub_download
             from moshi.models import loaders
 
-            self._model, self._processor = loaders.load_asr_model(
-                settings.asr_model_name,
+            logger.info("Attempting to load Kyutai STT with Moshi library...")
+
+            # Load the STT model using Moshi's loaders
+            # The moshi library provides streaming STT capabilities
+            self._model = loaders.load_stt(
+                self.model_name,
                 device=self._device,
-                cache_dir=settings.models_cache_dir,
+                dtype=self._dtype,
             )
-        except ImportError:
-            # Fallback: Use Whisper or another ASR model for development
-            logger.warning(
-                "Moshi ASR not available, falling back to Whisper for development"
+
+            # Load the Mimi audio codec (required for tokenizing audio)
+            self._mimi = loaders.load_mimi(
+                device=self._device,
+                dtype=self._dtype,
             )
-            self._load_whisper_fallback()
+
+            # Load text tokenizer
+            tokenizer_path = hf_hub_download(
+                self.model_name,
+                "tokenizer.model",
+                cache_dir=self.cache_dir,
+            )
+            self._text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)
+
+            self._use_transformers = False
+            logger.info(f"Loaded Kyutai STT with Moshi library: {self.model_name}")
+            return True
+
+        except ImportError as e:
+            logger.debug(f"Moshi import error: {e}")
+            return False
+        except Exception as e:
+            logger.debug(f"Failed to load with Moshi: {e}")
+            return False
 
     def _load_whisper_fallback(self) -> None:
         """Load Whisper as a fallback ASR model for development."""
@@ -111,14 +237,27 @@ class ASRService:
             from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
             model_name = "openai/whisper-base"
-            self._processor = WhisperProcessor.from_pretrained(model_name)
+            logger.info(f"Loading Whisper fallback: {model_name}")
+
+            self._processor = WhisperProcessor.from_pretrained(
+                model_name,
+                cache_dir=self.cache_dir,
+            )
             self._model = WhisperForConditionalGeneration.from_pretrained(
-                model_name
+                model_name,
+                torch_dtype=self._dtype,
+                cache_dir=self.cache_dir,
             ).to(self._device)
+
+            self._use_transformers = True
             logger.info("Loaded Whisper fallback model for ASR")
+
         except Exception as e:
             logger.error(f"Failed to load fallback ASR model: {e}")
-            raise
+            raise RuntimeError(
+                "No ASR model could be loaded. Please install moshi or ensure "
+                "transformers >= 4.53.0 is available."
+            ) from e
 
     async def unload_model(self) -> None:
         """Unload the model to free GPU memory."""
@@ -127,10 +266,23 @@ class ASRService:
                 return
 
             logger.info("Unloading ASR model")
-            del self._model
-            del self._processor
-            self._model = None
-            self._processor = None
+
+            # Clean up all model components
+            if self._model is not None:
+                del self._model
+                self._model = None
+
+            if self._mimi is not None:
+                del self._mimi
+                self._mimi = None
+
+            if hasattr(self, "_processor") and self._processor is not None:
+                del self._processor
+                self._processor = None
+
+            if self._text_tokenizer is not None:
+                del self._text_tokenizer
+                self._text_tokenizer = None
 
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
@@ -149,13 +301,13 @@ class ASRService:
             Numpy array of audio samples normalized to [-1, 1]
         """
         try:
-            # Try to decode as raw PCM first
+            # Try to decode as raw PCM first (most common from WebSocket)
             audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
             # Normalize to [-1, 1]
             audio_array = audio_array.astype(np.float32) / 32768.0
             return audio_array
         except Exception:
-            # Try using soundfile for other formats
+            # Try using soundfile for other formats (WAV, FLAC, etc.)
             try:
                 import soundfile as sf
 
@@ -181,7 +333,7 @@ class ASRService:
 
             return librosa.resample(audio, orig_sr=orig_sr, target_sr=target_sr)
         except ImportError:
-            # Simple resampling without librosa
+            # Simple linear interpolation resampling without librosa
             duration = len(audio) / orig_sr
             target_length = int(duration * target_sr)
             indices = np.linspace(0, len(audio) - 1, target_length)
@@ -236,37 +388,91 @@ class ASRService:
     def _transcribe_sync(self, audio_array: np.ndarray, language: str) -> str:
         """Synchronous transcription (runs in thread pool)."""
         try:
-            # Moshi ASR transcription
-            # Adjust this based on actual Moshi API
-            if hasattr(self._model, "transcribe"):
-                result = self._model.transcribe(audio_array)
-                return result.get("text", "")
+            if self._use_transformers:
+                return self._transcribe_transformers(audio_array, language)
             else:
-                # Whisper fallback
-                return self._transcribe_whisper(audio_array, language)
+                return self._transcribe_moshi(audio_array)
         except Exception as e:
             logger.error(f"Sync transcription failed: {e}")
             return ""
 
-    def _transcribe_whisper(self, audio_array: np.ndarray, language: str) -> str:
-        """Transcribe using Whisper model (fallback)."""
-        input_features = self._processor(
-            audio_array,
-            sampling_rate=self.sample_rate,
-            return_tensors="pt",
-        ).input_features.to(self._device)
-
-        with torch.no_grad():
-            predicted_ids = self._model.generate(
-                input_features,
-                language=language,
-                task="transcribe",
+    def _transcribe_moshi(self, audio_array: np.ndarray) -> str:
+        """Transcribe using Moshi STT model."""
+        try:
+            # Convert audio to tensor
+            audio_tensor = (
+                torch.from_numpy(audio_array)
+                .unsqueeze(0)
+                .to(device=self._device, dtype=self._dtype)
             )
 
-        transcription = self._processor.batch_decode(
-            predicted_ids, skip_special_tokens=True
-        )
-        return transcription[0] if transcription else ""
+            # Tokenize audio using Mimi
+            with torch.no_grad():
+                # Mimi expects audio at 24kHz, resample if needed
+                if self.sample_rate != 24000:
+                    import torchaudio.functional as F
+
+                    audio_tensor = F.resample(audio_tensor, self.sample_rate, 24000)
+
+                # Encode audio to tokens
+                audio_tokens = self._mimi.encode(audio_tensor)
+
+                # Run STT model
+                text_tokens = self._model.generate(audio_tokens)
+
+                # Decode text tokens
+                text = self._text_tokenizer.decode(text_tokens.cpu().tolist())
+
+            return text.strip()
+
+        except Exception as e:
+            logger.error(f"Moshi transcription failed: {e}")
+            raise
+
+    def _transcribe_transformers(self, audio_array: np.ndarray, language: str) -> str:
+        """Transcribe using transformers model (Kyutai or Whisper)."""
+        try:
+            # Prepare input features
+            inputs = self._processor(
+                audio_array,
+                sampling_rate=self.sample_rate,
+                return_tensors="pt",
+            )
+
+            # Move inputs to device
+            input_features = inputs.input_features.to(
+                device=self._device, dtype=self._dtype
+            )
+
+            with torch.no_grad():
+                # Generate transcription
+                if hasattr(self._model, "generate"):
+                    # Check if model supports language parameter (Whisper)
+                    generate_kwargs = {}
+                    if "whisper" in str(type(self._model)).lower():
+                        generate_kwargs = {
+                            "language": language,
+                            "task": "transcribe",
+                        }
+
+                    predicted_ids = self._model.generate(
+                        input_features,
+                        **generate_kwargs,
+                    )
+                else:
+                    # Direct forward pass for encoder-only models
+                    outputs = self._model(input_features)
+                    predicted_ids = outputs.logits.argmax(dim=-1)
+
+            # Decode tokens to text
+            transcription = self._processor.batch_decode(
+                predicted_ids, skip_special_tokens=True
+            )
+            return transcription[0] if transcription else ""
+
+        except Exception as e:
+            logger.error(f"Transformers transcription failed: {e}")
+            raise
 
     async def transcribe_stream(
         self, audio_stream: AsyncGenerator[bytes, None], language: str = "en"
@@ -285,25 +491,50 @@ class ASRService:
             await self.load_model()
 
         audio_buffer = b""
+        # Chunk size based on configured duration
         chunk_size = int(
             self.sample_rate * (self.chunk_duration_ms / 1000) * 2
-        )  # 2 bytes per sample
+        )  # 2 bytes per sample (16-bit)
+
+        # Accumulator for continuous context
+        accumulated_audio = b""
+        last_transcript = ""
 
         async for audio_chunk in audio_stream:
             audio_buffer += audio_chunk
+            accumulated_audio += audio_chunk
 
             # Process when we have enough audio
             if len(audio_buffer) >= chunk_size:
-                result = await self.transcribe(audio_buffer, language)
-                if result.text:
+                # Transcribe accumulated audio for better context
+                result = await self.transcribe(accumulated_audio, language)
+
+                # Only yield if we have new content
+                if result.text and result.text != last_transcript:
+                    # Mark as partial (not final) during streaming
+                    result.is_final = False
+                    last_transcript = result.text
                     yield result
+
                 audio_buffer = b""
 
-        # Process remaining audio
-        if audio_buffer:
-            result = await self.transcribe(audio_buffer, language)
+        # Process remaining audio as final
+        if accumulated_audio:
+            result = await self.transcribe(accumulated_audio, language)
             result.is_final = True
             yield result
+
+    async def get_model_info(self) -> dict:
+        """Get information about the loaded model."""
+        return {
+            "model_name": self.model_name,
+            "is_loaded": self._is_loaded,
+            "device": str(self._device) if self._device else None,
+            "dtype": str(self._dtype) if self._dtype else None,
+            "backend": "transformers" if self._use_transformers else "moshi",
+            "sample_rate": self.sample_rate,
+            "stream_delay_ms": self.stream_delay_ms,
+        }
 
 
 # Global service instance (singleton pattern)

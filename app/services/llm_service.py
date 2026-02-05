@@ -2,12 +2,23 @@
 LLM (Large Language Model) Service using vLLM with Qwen2.5.
 
 This service handles conversation generation for the AI-Talk English tutor.
+
+Model: https://huggingface.co/Qwen/Qwen2.5-7B-Instruct-AWQ
+- 7.61B parameters (AWQ 4-bit quantized)
+- ~4-5 GB VRAM
+- Context length up to 128K tokens
+- Supports 29+ languages
+
+Hardware Requirements:
+- ~4-5 GB VRAM for AWQ quantized model
+- CUDA 12.1+ recommended
 """
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import AsyncGenerator, List, Optional
+from typing import AsyncGenerator, Dict, List, Optional
 
+import torch
 from loguru import logger
 
 from app.config import settings
@@ -67,24 +78,33 @@ class LLMService:
     - Streaming token generation
     - Conversation context management
     - English tutoring capabilities
+
+    Hardware Requirements:
+    - ~4-5 GB VRAM for AWQ 4-bit quantized Qwen2.5-7B
+    - CUDA 12.1+ recommended
     """
 
     def __init__(self):
         """Initialize the LLM service."""
         self._model = None
         self._tokenizer = None
+        self._device = None
         self._is_loaded = False
         self._lock = asyncio.Lock()
+        self._use_vllm = False  # Flag to track which backend is used
 
         # Model configuration
         self.model_name = settings.llm_model_name
         self.max_model_len = settings.llm_max_model_len
         self.gpu_memory_utilization = settings.llm_gpu_memory_utilization
+        self.tensor_parallel_size = settings.llm_tensor_parallel_size
+        self.dtype = settings.llm_dtype
+        self.cache_dir = settings.models_cache_dir
 
-        # Generation defaults
-        self.default_max_tokens = 256
-        self.default_temperature = 0.7
-        self.default_top_p = 0.9
+        # Generation defaults from config
+        self.default_max_tokens = settings.llm_max_tokens
+        self.default_temperature = settings.llm_temperature
+        self.default_top_p = settings.llm_top_p
 
     @property
     def is_loaded(self) -> bool:
@@ -106,6 +126,12 @@ class LLMService:
             logger.info(f"Loading LLM model: {self.model_name}")
 
             try:
+                # Determine device
+                self._device = torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu"
+                )
+                logger.info(f"LLM using device: {self._device}")
+
                 # Load model in a thread pool to avoid blocking
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, self._load_model_sync)
@@ -119,44 +145,90 @@ class LLMService:
 
     def _load_model_sync(self) -> None:
         """Synchronous model loading (runs in thread pool)."""
+        # Try vLLM first (preferred for production)
+        if self._try_load_vllm():
+            return
+
+        # Fallback to transformers
+        logger.warning("vLLM not available, falling back to transformers")
+        self._load_transformers_fallback()
+
+    def _try_load_vllm(self) -> bool:
+        """Try loading with vLLM (preferred for production)."""
         try:
             from vllm import LLM
+
+            logger.info("Attempting to load LLM with vLLM...")
+
+            # Determine dtype for vLLM
+            vllm_dtype = self.dtype
+            if vllm_dtype == "auto":
+                vllm_dtype = "auto"
+            elif vllm_dtype in ["float16", "fp16"]:
+                vllm_dtype = "float16"
+            elif vllm_dtype in ["bfloat16", "bf16"]:
+                vllm_dtype = "bfloat16"
 
             self._model = LLM(
                 model=self.model_name,
                 gpu_memory_utilization=self.gpu_memory_utilization,
                 max_model_len=self.max_model_len,
-                trust_remote_code=True,
-                download_dir=settings.models_cache_dir,
+                tensor_parallel_size=self.tensor_parallel_size,
+                dtype=vllm_dtype,
+                trust_remote_code=settings.trust_remote_code,
+                download_dir=self.cache_dir,
+                # AWQ quantization is auto-detected
             )
+
+            self._use_vllm = True
             logger.info(f"vLLM loaded with model: {self.model_name}")
+            return True
 
         except ImportError as e:
-            logger.warning(f"vLLM not available: {e}, falling back to transformers")
-            self._load_transformers_fallback()
+            logger.debug(f"vLLM import error: {e}")
+            return False
+        except Exception as e:
+            logger.debug(f"Failed to load with vLLM: {e}")
+            return False
 
     def _load_transformers_fallback(self) -> None:
         """Load model using transformers as fallback (for development without vLLM)."""
         try:
-            import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            logger.info("Attempting to load LLM with transformers...")
+
+            # Determine dtype
+            if self.dtype == "auto":
+                torch_dtype = torch.float16
+            elif self.dtype in ["bfloat16", "bf16"]:
+                torch_dtype = torch.bfloat16
+            else:
+                torch_dtype = torch.float16
 
             self._tokenizer = AutoTokenizer.from_pretrained(
                 self.model_name,
-                trust_remote_code=True,
+                trust_remote_code=settings.trust_remote_code,
+                cache_dir=self.cache_dir,
             )
 
             self._model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
-                torch_dtype=torch.float16,
+                torch_dtype=torch_dtype,
                 device_map="auto",
-                trust_remote_code=True,
+                trust_remote_code=settings.trust_remote_code,
+                cache_dir=self.cache_dir,
             )
+
+            self._use_vllm = False
             logger.info("Loaded model with transformers fallback")
 
         except Exception as e:
             logger.error(f"Failed to load fallback model: {e}")
-            raise
+            raise RuntimeError(
+                "No LLM model could be loaded. Please install vLLM or ensure "
+                "transformers is properly configured."
+            ) from e
 
     async def unload_model(self) -> None:
         """Unload the model to free GPU memory."""
@@ -166,19 +238,22 @@ class LLMService:
 
             logger.info("Unloading LLM model")
 
-            import torch
+            # Clean up model
+            if self._model is not None:
+                del self._model
+                self._model = None
 
-            del self._model
-            self._model = None
-
-            if self._tokenizer:
+            # Clean up tokenizer
+            if self._tokenizer is not None:
                 del self._tokenizer
                 self._tokenizer = None
 
+            # Clear CUDA cache
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
             self._is_loaded = False
+            self._use_vllm = False
             logger.info("LLM model unloaded")
 
     async def generate(
@@ -233,8 +308,20 @@ class LLMService:
         """Synchronous generation (runs in thread pool)."""
         messages = context.format_for_llm()
 
+        if self._use_vllm:
+            return self._generate_vllm(messages, max_tokens, temperature, top_p)
+        else:
+            return self._generate_transformers(messages, max_tokens, temperature, top_p)
+
+    def _generate_vllm(
+        self,
+        messages: List[dict],
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+    ) -> str:
+        """Generate using vLLM."""
         try:
-            # Try vLLM generation
             from vllm import SamplingParams
 
             sampling_params = SamplingParams(
@@ -252,9 +339,9 @@ class LLMService:
 
             return generated_text
 
-        except (ImportError, AttributeError):
-            # Fallback to transformers
-            return self._generate_transformers(messages, max_tokens, temperature, top_p)
+        except Exception as e:
+            logger.error(f"vLLM generation failed: {e}")
+            raise
 
     def _format_chat_prompt(self, messages: List[dict]) -> str:
         """Format messages into a chat prompt string."""
@@ -285,8 +372,6 @@ class LLMService:
         top_p: float,
     ) -> str:
         """Generate using transformers (fallback)."""
-        import torch
-
         # Use chat template if available
         if hasattr(self._tokenizer, "apply_chat_template"):
             input_ids = self._tokenizer.apply_chat_template(
@@ -344,31 +429,36 @@ class LLMService:
 
         try:
             # Check if we have vLLM with streaming support
-            try:
-                from vllm import SamplingParams
+            if self._use_vllm:
+                try:
+                    from vllm import SamplingParams
 
-                sampling_params = SamplingParams(
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                    stop=["User:", "\n\nUser", "<|im_end|>", "<|endoftext|>"],
-                )
+                    sampling_params = SamplingParams(
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop=["User:", "\n\nUser", "<|im_end|>", "<|endoftext|>"],
+                    )
 
-                messages = context.format_for_llm()
-                prompt = self._format_chat_prompt(messages)
+                    messages = context.format_for_llm()
+                    prompt = self._format_chat_prompt(messages)
 
-                # Use vLLM streaming if available
-                async for token in self._stream_vllm(prompt, sampling_params):
-                    yield token
+                    # Use vLLM streaming if available
+                    async for token in self._stream_vllm(prompt, sampling_params):
+                        yield token
+                    return  # Exit after successful streaming
 
-            except (ImportError, AttributeError):
-                # Fallback to non-streaming generation
-                response = await self.generate(context, max_tokens, temperature, top_p)
-                # Simulate streaming by yielding chunks
-                words = response.split()
-                for word in words:
-                    yield word + " "
-                    await asyncio.sleep(0.02)  # Small delay to simulate streaming
+                except (ImportError, AttributeError, Exception) as e:
+                    logger.debug(f"vLLM streaming not available: {e}")
+                    # Fall through to non-streaming fallback
+
+            # Fallback to non-streaming generation
+            response = await self.generate(context, max_tokens, temperature, top_p)
+            # Simulate streaming by yielding chunks
+            words = response.split()
+            for word in words:
+                yield word + " "
+                await asyncio.sleep(0.02)  # Small delay to simulate streaming
 
         except Exception as e:
             logger.error(f"Streaming generation failed: {e}")
@@ -423,6 +513,33 @@ class LLMService:
             A new ConversationContext instance
         """
         return ConversationContext(user_level=user_level)
+
+    async def get_model_info(self) -> Dict:
+        """Get information about the loaded model."""
+        gpu_info = None
+        if torch.cuda.is_available():
+            gpu_info = {
+                "name": torch.cuda.get_device_name(0),
+                "memory_total_gb": round(
+                    torch.cuda.get_device_properties(0).total_memory / (1024**3), 2
+                ),
+                "memory_allocated_gb": round(
+                    torch.cuda.memory_allocated(0) / (1024**3), 2
+                ),
+            }
+
+        return {
+            "model_name": self.model_name,
+            "is_loaded": self._is_loaded,
+            "backend": "vllm" if self._use_vllm else "transformers",
+            "device": str(self._device) if self._device else None,
+            "max_model_len": self.max_model_len,
+            "gpu_memory_utilization": self.gpu_memory_utilization,
+            "default_max_tokens": self.default_max_tokens,
+            "default_temperature": self.default_temperature,
+            "default_top_p": self.default_top_p,
+            "gpu_info": gpu_info,
+        }
 
 
 # Global service instance (singleton pattern)
