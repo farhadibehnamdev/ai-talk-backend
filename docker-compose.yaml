@@ -1,0 +1,57 @@
+# AI-Talk Backend - Docker Compose
+# Run with: docker-compose up -d
+
+version: "3.8"
+
+services:
+  ai-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ai-talk-backend
+    restart: unless-stopped
+
+    # GPU Support
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - DEBUG=${DEBUG:-false}
+      - LLM_MODEL_NAME=${LLM_MODEL_NAME:-Qwen/Qwen2.5-7B-Instruct-AWQ}
+      - LLM_GPU_MEMORY_UTILIZATION=${LLM_GPU_MEMORY_UTILIZATION:-0.6}
+      - ASR_MODEL_NAME=${ASR_MODEL_NAME:-kyutai/moshi-asr}
+      - TTS_MODEL_NAME=${TTS_MODEL_NAME:-kyutai/moshi-tts}
+      - PRELOAD_MODELS=${PRELOAD_MODELS:-true}
+      - MODELS_CACHE_DIR=/app/models
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://your-frontend.vercel.app}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - HF_HOME=/app/models
+      - TRANSFORMERS_CACHE=/app/models
+
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+
+    volumes:
+      - ai_models:/app/models
+      - ai_logs:/app/logs
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  ai_models:
+    driver: local
+  ai_logs:
+    driver: local

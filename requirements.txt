@@ -1,0 +1,42 @@
+# FastAPI and server
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+websockets==14.1
+python-multipart==0.0.18
+
+# Environment and configuration
+python-dotenv==1.0.1
+pydantic==2.10.4
+pydantic-settings==2.7.1
+
+# ML/AI frameworks
+torch==2.5.1
+torchaudio==2.5.1
+numpy==1.26.4
+transformers==4.47.1
+accelerate==1.2.1
+
+# vLLM for fast LLM inference
+vllm==0.6.6.post1
+
+# Kyutai Moshi (ASR + TTS)
+# Install from GitHub: pip install git+https://github.com/kyutai-labs/moshi.git
+moshi==0.2.2
+
+# Audio processing
+soundfile==0.12.1
+librosa==0.10.2.post1
+scipy==1.14.1
+
+# Async support
+aiofiles==24.1.0
+anyio==4.7.0
+
+# Redis for session management (optional)
+redis==5.2.1
+
+# Logging and monitoring
+loguru==0.7.3
+
+# HTTP client
+httpx==0.28.1
