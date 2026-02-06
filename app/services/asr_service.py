@@ -419,7 +419,13 @@ class ASRService:
                 return self._decode_with_ffmpeg(audio_bytes)
             except Exception as e:
                 logger.error(f"ffmpeg decode failed: {e}")
-                # Fall through to try other methods
+                # Don't fall back to raw PCM — interpreting encoded data as PCM
+                # produces garbled noise that Whisper hallucinates on.
+                logger.warning(
+                    "Encoded audio could not be decoded. "
+                    "This chunk may be missing the WebM header (stale buffer)."
+                )
+                return np.array([], dtype=np.float32)
 
         # Step 2: Try as raw PCM 16-bit
         try:

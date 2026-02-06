@@ -16,6 +16,7 @@ import asyncio
 import io
 import json
 import struct
+import time
 import uuid
 import wave
 from dataclasses import dataclass, field
@@ -198,6 +199,9 @@ async def conversation_endpoint(websocket: WebSocket):
         # We need enough audio for meaningful ASR transcription.
         audio_buffer = b""
         min_audio_length = 16000  # ~16KB of encoded audio ≈ 1-2s of speech
+        is_ai_responding = False  # Flag to ignore audio during AI response
+        turn_ended_at = 0.0  # Timestamp when last AI turn ended
+        POST_TURN_DISCARD_SEC = 0.5  # Discard audio for 0.5s after AI finishes
 
         while manager.is_connected(session_id):
             try:
@@ -211,22 +215,37 @@ async def conversation_endpoint(websocket: WebSocket):
                 if "bytes" in message:
                     # Binary message: audio data
                     audio_data = message["bytes"]
-                    logger.debug(
-                        f"Received audio chunk from {session_id}: "
-                        f"{len(audio_data)} bytes"
-                    )
+
+                    # Ignore audio while AI is responding (prevents echo loop)
+                    if is_ai_responding:
+                        continue
+
+                    # Discard stale audio that was buffered during the AI turn
+                    if (
+                        turn_ended_at > 0
+                        and (time.time() - turn_ended_at) < POST_TURN_DISCARD_SEC
+                    ):
+                        continue
+
                     audio_buffer += audio_data
 
                     # Process when we have enough audio
                     if len(audio_buffer) >= min_audio_length:
-                        await process_audio_turn(
-                            session_id=session_id,
-                            session=session,
-                            audio_data=audio_buffer,
-                            asr_service=asr_service,
-                            llm_service=llm_service,
-                            tts_service=tts_service,
-                        )
+                        is_ai_responding = True
+                        try:
+                            await process_audio_turn(
+                                session_id=session_id,
+                                session=session,
+                                audio_data=audio_buffer,
+                                asr_service=asr_service,
+                                llm_service=llm_service,
+                                tts_service=tts_service,
+                            )
+                        finally:
+                            is_ai_responding = False
+                            turn_ended_at = time.time()
+                        # Reset buffer completely — frontend will start a new
+                        # WebM stream (with fresh header) on next recording
                         audio_buffer = b""
 
                 elif "text" in message:
@@ -258,14 +277,19 @@ async def conversation_endpoint(websocket: WebSocket):
                     elif msg_type == MessageType.END_CONVERSATION:
                         # Process any remaining audio
                         if audio_buffer:
-                            await process_audio_turn(
-                                session_id=session_id,
-                                session=session,
-                                audio_data=audio_buffer,
-                                asr_service=asr_service,
-                                llm_service=llm_service,
-                                tts_service=tts_service,
-                            )
+                            is_ai_responding = True
+                            try:
+                                await process_audio_turn(
+                                    session_id=session_id,
+                                    session=session,
+                                    audio_data=audio_buffer,
+                                    asr_service=asr_service,
+                                    llm_service=llm_service,
+                                    tts_service=tts_service,
+                                )
+                            finally:
+                                is_ai_responding = False
+                                turn_ended_at = time.time()
                             audio_buffer = b""
 
                         # Generate and send analysis
@@ -278,14 +302,19 @@ async def conversation_endpoint(websocket: WebSocket):
                     elif msg_type == "process_audio":
                         # Explicit request to process accumulated audio
                         if audio_buffer:
-                            await process_audio_turn(
-                                session_id=session_id,
-                                session=session,
-                                audio_data=audio_buffer,
-                                asr_service=asr_service,
-                                llm_service=llm_service,
-                                tts_service=tts_service,
-                            )
+                            is_ai_responding = True
+                            try:
+                                await process_audio_turn(
+                                    session_id=session_id,
+                                    session=session,
+                                    audio_data=audio_buffer,
+                                    asr_service=asr_service,
+                                    llm_service=llm_service,
+                                    tts_service=tts_service,
+                                )
+                            finally:
+                                is_ai_responding = False
+                                turn_ended_at = time.time()
                             audio_buffer = b""
 
             except WebSocketDisconnect:
