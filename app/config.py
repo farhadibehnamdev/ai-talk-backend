@@ -69,6 +69,18 @@ class Settings(BaseSettings):
         default=2500,
         description="STT streaming delay in milliseconds (2500 for 2.6b-en, 500 for 1b-en_fr)",
     )
+    asr_prefer_moshi: bool = Field(
+        default=True,
+        description="Prefer Moshi backend for Kyutai STT models (more stable on CUDA)",
+    )
+    asr_enable_kyutai_transformers: bool = Field(
+        default=False,
+        description="Enable Kyutai STT via transformers backend (disabled by default for stability)",
+    )
+    asr_kyutai_attn_implementation: str = Field(
+        default="eager",
+        description="Attention implementation for Kyutai transformers backend (eager, sdpa, flash_attention_2)",
+    )
 
     # ===========================================
     # TTS (Text-to-Speech) Model Configuration

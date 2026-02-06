@@ -182,6 +182,9 @@ cp env.example .env
 | `LLM_GPU_MEMORY_UTILIZATION` | `0.35` | GPU memory fraction for LLM |
 | `ASR_MODEL_NAME` | `kyutai/stt-2.6b-en` | STT model |
 | `ASR_SAMPLE_RATE` | `16000` | Audio input sample rate |
+| `ASR_PREFER_MOSHI` | `true` | Prefer Moshi backend for Kyutai STT stability |
+| `ASR_ENABLE_KYUTAI_TRANSFORMERS` | `false` | Enable Kyutai STT via transformers backend |
+| `ASR_KYUTAI_ATTN_IMPLEMENTATION` | `eager` | Attention impl for Kyutai transformers backend |
 | `TTS_MODEL_NAME` | `kyutai/tts-1.6b-en_fr` | TTS model |
 | `TTS_SAMPLE_RATE` | `24000` | Audio output sample rate |
 
