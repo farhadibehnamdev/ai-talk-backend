@@ -594,7 +594,7 @@ class ASRService:
                     )
 
                 # Processor call — per official docs, just pass the audio array
-                inputs = self._processor(audio_array)
+                inputs = self._processor(audio=audio_array)
 
                 logger.debug(f"Kyutai processor output keys: {list(inputs.keys())}")
 
