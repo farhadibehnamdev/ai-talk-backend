@@ -101,6 +101,14 @@ class Settings(BaseSettings):
         default=2.0,
         description="Apply low-information noise transcript filter only for short chunks",
     )
+    asr_drop_common_false_positives: bool = Field(
+        default=True,
+        description="Drop frequent standalone false-positive transcripts (e.g., 'you')",
+    )
+    asr_common_false_positive_words: str = Field(
+        default="you",
+        description="Comma-separated standalone words to drop as false positives",
+    )
 
     # ===========================================
     # TTS (Text-to-Speech) Model Configuration
@@ -186,6 +194,22 @@ class Settings(BaseSettings):
     )
     ws_ping_timeout: int = Field(
         default=10, description="WebSocket ping timeout in seconds"
+    )
+    ws_min_audio_buffer_bytes: int = Field(
+        default=24000,
+        description="Minimum buffered audio bytes before ASR turn processing",
+    )
+    ws_max_audio_buffer_bytes: int = Field(
+        default=160000,
+        description="Maximum buffered audio bytes before forcing ASR turn processing",
+    )
+    ws_speech_end_silence_ms: int = Field(
+        default=700,
+        description="Silence window in ms to detect end-of-user-turn",
+    )
+    ws_barge_in_min_bytes: int = Field(
+        default=24000,
+        description="Buffered bytes required during AI response to trigger interruption",
     )
 
     # ===========================================

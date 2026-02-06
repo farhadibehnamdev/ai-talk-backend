@@ -29,6 +29,7 @@ import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from loguru import logger
 
+from app.config import settings
 from app.prompts import UserLevel
 from app.services import AnalysisService, ASRService, LLMService, TTSService
 from app.services.analysis_service import get_analysis_service
@@ -148,29 +149,10 @@ manager = ConnectionManager()
 
 @router.websocket("/ws/conversation")
 async def conversation_endpoint(websocket: WebSocket):
-    """
-    WebSocket endpoint for real-time conversation.
-
-    Message Protocol:
-
-    Client -> Server:
-    - Binary data: Audio bytes (PCM 16-bit, 16kHz, mono)
-    - JSON: {"type": "end_conversation"} - End and get analysis
-    - JSON: {"type": "set_level", "level": "beginner|intermediate|advanced"}
-    - JSON: {"type": "ping"}
-
-    Server -> Client:
-    - JSON: {"type": "connected", "session_id": "..."}
-    - JSON: {"type": "transcript", "text": "...", "is_final": true/false}
-    - JSON: {"type": "ai_text", "text": "...", "is_complete": true/false}
-    - Binary: Audio data (PCM 16-bit, 24kHz, mono)
-    - JSON: {"type": "ai_audio_start"} - Signals audio stream starting
-    - JSON: {"type": "turn_complete"} - AI finished responding
-    - JSON: {"type": "analysis", "data": {...}} - Conversation feedback
-    - JSON: {"type": "error", "message": "..."}
-    - JSON: {"type": "pong"}
-    """
+    """WebSocket endpoint for real-time conversation."""
     session_id = str(uuid.uuid4())
+    turn_task: Optional[asyncio.Task] = None
+    silence_watcher_task: Optional[asyncio.Task] = None
 
     try:
         await manager.connect(websocket, session_id)
@@ -193,19 +175,78 @@ async def conversation_endpoint(websocket: WebSocket):
         # Get or create session
         session = manager.get_session(session_id)
 
-        # Audio buffer for accumulating chunks
-        # Note: Frontend sends encoded audio (Opus/WebM) not raw PCM.
-        # Encoded Opus chunks are ~2KB per ~120ms, so ~16KB ≈ 1-2 seconds of speech.
-        # We need enough audio for meaningful ASR transcription.
-        audio_buffer = b""
-        min_audio_length = 16000  # ~16KB of encoded audio ≈ 1-2s of speech
-        is_ai_responding = False  # Flag to ignore audio during AI response
-        turn_ended_at = 0.0  # Timestamp when last AI turn ended
-        POST_TURN_DISCARD_SEC = 0.5  # Discard audio for 0.5s after AI finishes
+        # Turn detection and interruption settings.
+        audio_buffer = bytearray()
+        audio_lock = asyncio.Lock()
+        last_audio_at = 0.0
+        barge_in_buffered_bytes = 0
+        barge_in_audio_buffer = bytearray()
+        min_audio_length = settings.ws_min_audio_buffer_bytes
+        max_audio_length = settings.ws_max_audio_buffer_bytes
+        speech_end_silence_sec = settings.ws_speech_end_silence_ms / 1000.0
+        barge_in_min_bytes = settings.ws_barge_in_min_bytes
+
+        async def process_turn_async(turn_audio: bytes) -> None:
+            """Run one ASR->LLM->TTS turn in a cancellable task."""
+            nonlocal turn_task
+            try:
+                await process_audio_turn(
+                    session_id=session_id,
+                    session=session,
+                    audio_data=turn_audio,
+                    asr_service=asr_service,
+                    llm_service=llm_service,
+                    tts_service=tts_service,
+                )
+            except asyncio.CancelledError:
+                logger.info(f"Turn cancelled for {session_id} (barge-in)")
+                raise
+            except Exception:
+                logger.exception(f"Unhandled turn task error for {session_id}")
+            finally:
+                turn_task = None
+
+        async def maybe_start_turn(force: bool = False) -> bool:
+            """Start a turn when buffered audio is ready."""
+            nonlocal turn_task, barge_in_buffered_bytes, barge_in_audio_buffer, last_audio_at
+            if turn_task is not None and not turn_task.done():
+                return False
+
+            async with audio_lock:
+                if len(audio_buffer) == 0:
+                    return False
+
+                if not force:
+                    if len(audio_buffer) < min_audio_length:
+                        return False
+                    if (
+                        last_audio_at <= 0
+                        or (time.time() - last_audio_at) < speech_end_silence_sec
+                    ):
+                        return False
+
+                turn_audio = bytes(audio_buffer)
+                audio_buffer.clear()
+                barge_in_buffered_bytes = 0
+                barge_in_audio_buffer.clear()
+                last_audio_at = 0.0
+
+            logger.debug(
+                f"Starting turn for {session_id}: {len(turn_audio)} buffered bytes"
+            )
+            turn_task = asyncio.create_task(process_turn_async(turn_audio))
+            return True
+
+        async def silence_watcher() -> None:
+            """Background task to flush turns after speech-end silence."""
+            while manager.is_connected(session_id):
+                await asyncio.sleep(0.1)
+                await maybe_start_turn(force=False)
+
+        silence_watcher_task = asyncio.create_task(silence_watcher())
 
         while manager.is_connected(session_id):
             try:
-                # Receive message (can be binary or text)
                 message = await websocket.receive()
 
                 if message.get("type") == "websocket.disconnect":
@@ -213,43 +254,56 @@ async def conversation_endpoint(websocket: WebSocket):
                     break
 
                 if "bytes" in message:
-                    # Binary message: audio data
-                    audio_data = message["bytes"]
-
-                    # Ignore audio while AI is responding (prevents echo loop)
-                    if is_ai_responding:
+                    audio_data = message["bytes"] or b""
+                    if len(audio_data) == 0:
                         continue
 
-                    # Discard stale audio that was buffered during the AI turn
+                    # Drop stale barge-in candidate once AI turn has completed.
                     if (
-                        turn_ended_at > 0
-                        and (time.time() - turn_ended_at) < POST_TURN_DISCARD_SEC
+                        (turn_task is None or turn_task.done())
+                        and barge_in_buffered_bytes > 0
                     ):
-                        continue
+                        barge_in_buffered_bytes = 0
+                        barge_in_audio_buffer.clear()
 
-                    audio_buffer += audio_data
+                    # Barge-in: if user keeps sending audio while AI is responding,
+                    # cancel the current turn and switch to user speech.
+                    if turn_task is not None and not turn_task.done():
+                        barge_in_audio_buffer.extend(audio_data)
+                        barge_in_buffered_bytes += len(audio_data)
+                        if barge_in_buffered_bytes < barge_in_min_bytes:
+                            continue
 
-                    # Process when we have enough audio
-                    if len(audio_buffer) >= min_audio_length:
-                        is_ai_responding = True
+                        logger.info(
+                            f"Barge-in detected for {session_id}: "
+                            f"{barge_in_buffered_bytes} bytes during AI response"
+                        )
+                        turn_task.cancel()
                         try:
-                            await process_audio_turn(
-                                session_id=session_id,
-                                session=session,
-                                audio_data=audio_buffer,
-                                asr_service=asr_service,
-                                llm_service=llm_service,
-                                tts_service=tts_service,
-                            )
-                        finally:
-                            is_ai_responding = False
-                            turn_ended_at = time.time()
-                        # Reset buffer completely — frontend will start a new
-                        # WebM stream (with fresh header) on next recording
-                        audio_buffer = b""
+                            await turn_task
+                        except asyncio.CancelledError:
+                            pass
+                        turn_task = None
+                        audio_data = bytes(barge_in_audio_buffer)
+                        barge_in_buffered_bytes = 0
+                        barge_in_audio_buffer.clear()
+
+                        # Signal interruption so frontend can stop playback.
+                        await manager.send_json(
+                            session_id,
+                            {"type": MessageType.TURN_COMPLETE, "interrupted": True},
+                        )
+
+                    async with audio_lock:
+                        audio_buffer.extend(audio_data)
+                        last_audio_at = time.time()
+                        buffered_len = len(audio_buffer)
+
+                    # Safety flush for very long utterances.
+                    if buffered_len >= max_audio_length:
+                        await maybe_start_turn(force=True)
 
                 elif "text" in message:
-                    # JSON message
                     data = json.loads(message["text"])
                     msg_type = data.get("type")
 
@@ -275,24 +329,15 @@ async def conversation_endpoint(websocket: WebSocket):
                             )
 
                     elif msg_type == MessageType.END_CONVERSATION:
-                        # Process any remaining audio
-                        if audio_buffer:
-                            is_ai_responding = True
+                        # Process remaining audio and wait for turn completion.
+                        await maybe_start_turn(force=True)
+                        active_turn = turn_task
+                        if active_turn is not None:
                             try:
-                                await process_audio_turn(
-                                    session_id=session_id,
-                                    session=session,
-                                    audio_data=audio_buffer,
-                                    asr_service=asr_service,
-                                    llm_service=llm_service,
-                                    tts_service=tts_service,
-                                )
-                            finally:
-                                is_ai_responding = False
-                                turn_ended_at = time.time()
-                            audio_buffer = b""
+                                await active_turn
+                            except asyncio.CancelledError:
+                                pass
 
-                        # Generate and send analysis
                         await send_analysis(
                             session_id=session_id,
                             session=session,
@@ -300,22 +345,8 @@ async def conversation_endpoint(websocket: WebSocket):
                         )
 
                     elif msg_type == "process_audio":
-                        # Explicit request to process accumulated audio
-                        if audio_buffer:
-                            is_ai_responding = True
-                            try:
-                                await process_audio_turn(
-                                    session_id=session_id,
-                                    session=session,
-                                    audio_data=audio_buffer,
-                                    asr_service=asr_service,
-                                    llm_service=llm_service,
-                                    tts_service=tts_service,
-                                )
-                            finally:
-                                is_ai_responding = False
-                                turn_ended_at = time.time()
-                            audio_buffer = b""
+                        # Explicit request to flush buffered audio now.
+                        await maybe_start_turn(force=True)
 
             except WebSocketDisconnect:
                 raise
@@ -327,7 +358,6 @@ async def conversation_endpoint(websocket: WebSocket):
                 )
             except Exception as e:
                 error_msg = str(e)
-                # Detect disconnect-related errors and stop the loop
                 if "disconnect" in error_msg.lower() or "close" in error_msg.lower():
                     logger.info(f"Connection lost for {session_id}: {error_msg}")
                     break
@@ -336,7 +366,6 @@ async def conversation_endpoint(websocket: WebSocket):
                     session_id,
                     {"type": MessageType.ERROR, "message": error_msg},
                 ):
-                    # Send failed — connection is dead, stop the loop
                     break
 
     except WebSocketDisconnect:
@@ -344,6 +373,20 @@ async def conversation_endpoint(websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket error for {session_id}: {e}")
     finally:
+        if silence_watcher_task is not None:
+            silence_watcher_task.cancel()
+            try:
+                await silence_watcher_task
+            except asyncio.CancelledError:
+                pass
+
+        if turn_task is not None and not turn_task.done():
+            turn_task.cancel()
+            try:
+                await turn_task
+            except asyncio.CancelledError:
+                pass
+
         manager.disconnect(session_id)
 
 
@@ -505,6 +548,9 @@ async def process_audio_turn(
 
         logger.debug(f"Turn complete for {session_id}")
 
+    except asyncio.CancelledError:
+        logger.info(f"Audio turn interrupted for {session_id}")
+        raise
     except Exception as e:
         logger.error(f"Error in audio turn processing for {session_id}: {e}")
         if manager.is_connected(session_id):

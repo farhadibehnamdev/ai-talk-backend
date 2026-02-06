@@ -81,6 +81,12 @@ class ASRService:
         self._silence_peak_threshold = settings.asr_silence_peak_threshold
         self._filter_noise_transcripts = settings.asr_filter_noise_transcripts
         self._noise_max_duration_s = settings.asr_noise_max_duration_s
+        self._drop_common_false_positives = settings.asr_drop_common_false_positives
+        self._common_false_positive_words = {
+            w.strip().lower()
+            for w in settings.asr_common_false_positive_words.split(",")
+            if w.strip()
+        }
 
     @property
     def is_loaded(self) -> bool:
@@ -666,6 +672,17 @@ class ASRService:
             text = await loop.run_in_executor(
                 None, self._transcribe_sync, audio_array, language
             )
+
+            # Hard filter for common standalone false positives (e.g. repeated "you").
+            if self._drop_common_false_positives and duration_sec <= self._noise_max_duration_s:
+                normalized = re.sub(r"\s+", " ", text.strip().lower())
+                normalized = re.sub(r"[^a-z0-9' ]", "", normalized).strip()
+                if normalized in self._common_false_positive_words:
+                    logger.info(
+                        f"Dropping common false-positive transcript: '{text.strip()}' "
+                        f"(duration={duration_sec:.2f}s)"
+                    )
+                    text = ""
 
             # Filter typical short hallucinations from weak/short chunks (e.g. "you")
             if (
