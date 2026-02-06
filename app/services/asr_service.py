@@ -306,6 +306,11 @@ class ASRService:
         """
         try:
             # Try to decode as raw PCM first (most common from WebSocket)
+            # Ensure even number of bytes for int16 decoding
+            if len(audio_bytes) % 2 != 0:
+                audio_bytes = audio_bytes[:-1]
+            if len(audio_bytes) == 0:
+                return np.array([], dtype=np.float32)
             audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
             # Normalize to [-1, 1]
             audio_array = audio_array.astype(np.float32) / 32768.0
@@ -476,9 +481,11 @@ class ASRService:
                 logger.warning(
                     "Processor returned empty output, converting audio array directly to tensor"
                 )
+                # Mimi codec expects 3D: (batch, channels, length)
                 input_tensor = (
                     torch.tensor(audio_array, dtype=self._dtype)
-                    .unsqueeze(0)
+                    .unsqueeze(0)  # channel dim -> (1, length)
+                    .unsqueeze(0)  # batch dim -> (1, 1, length)
                     .to(self._device)
                 )
                 input_key = "input_values"
