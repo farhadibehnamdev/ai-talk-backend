@@ -14,6 +14,7 @@ Model: https://huggingface.co/kyutai/stt-2.6b-en
 
 import asyncio
 import io
+import re
 from dataclasses import dataclass
 from typing import AsyncGenerator, Optional
 
@@ -75,6 +76,11 @@ class ASRService:
         self._prefer_moshi = settings.asr_prefer_moshi
         self._enable_kyutai_transformers = settings.asr_enable_kyutai_transformers
         self._kyutai_attn_implementation = settings.asr_kyutai_attn_implementation
+        self._whisper_fallback_model = settings.asr_whisper_fallback_model
+        self._silence_rms_threshold = settings.asr_silence_rms_threshold
+        self._silence_peak_threshold = settings.asr_silence_peak_threshold
+        self._filter_noise_transcripts = settings.asr_filter_noise_transcripts
+        self._noise_max_duration_s = settings.asr_noise_max_duration_s
 
     @property
     def is_loaded(self) -> bool:
@@ -315,7 +321,7 @@ class ASRService:
             from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
             if model_name is None:
-                model_name = "openai/whisper-base"
+                model_name = self._whisper_fallback_model
             logger.info(f"Loading Whisper model: {model_name}")
 
             self._processor = WhisperProcessor.from_pretrained(
@@ -329,6 +335,7 @@ class ASRService:
             ).to(self._device)
 
             self._use_transformers = True
+            self._model_sample_rate = 16000
             logger.info("Loaded Whisper fallback model for ASR")
 
         except Exception as e:
@@ -571,6 +578,39 @@ class ASRService:
             indices = np.linspace(0, len(audio) - 1, target_length)
             return np.interp(indices, np.arange(len(audio)), audio)
 
+    def _compute_audio_stats(self, audio_array: np.ndarray) -> tuple[float, float, float]:
+        """Return duration (s), RMS, and peak for normalized audio."""
+        if audio_array is None or len(audio_array) == 0:
+            return 0.0, 0.0, 0.0
+        duration_sec = len(audio_array) / float(self.sample_rate)
+        rms = float(np.sqrt(np.mean(np.square(audio_array, dtype=np.float32))))
+        peak = float(np.max(np.abs(audio_array)))
+        return duration_sec, rms, peak
+
+    def _is_low_energy_audio(self, audio_array: np.ndarray) -> bool:
+        """Detect likely non-speech chunks based on decoded waveform energy."""
+        _, rms, peak = self._compute_audio_stats(audio_array)
+        return rms < self._silence_rms_threshold and peak < self._silence_peak_threshold
+
+    def _is_low_information_text(self, text: str) -> bool:
+        """Detect common short hallucination patterns from low-energy audio."""
+        normalized = re.sub(r"\s+", " ", text.strip().lower())
+        normalized = re.sub(r"[^a-z0-9' ]", "", normalized).strip()
+        if not normalized:
+            return True
+
+        words = normalized.split()
+        if not words:
+            return True
+
+        if len(words) == 1 and words[0] in {"you", "yeah", "uh", "um", "hmm", "mm"}:
+            return True
+
+        if len(words) <= 3 and len(set(words)) == 1:
+            return True
+
+        return False
+
     async def transcribe(
         self, audio_bytes: bytes, language: str = "en"
     ) -> TranscriptionResult:
@@ -610,11 +650,35 @@ class ASRService:
                     text="", is_final=True, confidence=0.0, language=language
                 )
 
+            duration_sec, rms, peak = self._compute_audio_stats(audio_array)
+            low_energy = self._is_low_energy_audio(audio_array)
+            if low_energy:
+                logger.debug(
+                    f"Skipping transcription: low-energy audio "
+                    f"(duration={duration_sec:.2f}s, rms={rms:.5f}, peak={peak:.5f})"
+                )
+                return TranscriptionResult(
+                    text="", is_final=True, confidence=0.0, language=language
+                )
+
             # Run transcription in thread pool
             loop = asyncio.get_event_loop()
             text = await loop.run_in_executor(
                 None, self._transcribe_sync, audio_array, language
             )
+
+            # Filter typical short hallucinations from weak/short chunks (e.g. "you")
+            if (
+                self._filter_noise_transcripts
+                and duration_sec <= self._noise_max_duration_s
+                and rms < (self._silence_rms_threshold * 2.0)
+                and self._is_low_information_text(text)
+            ):
+                logger.info(
+                    f"Dropping likely noise transcript: '{text.strip()}' "
+                    f"(duration={duration_sec:.2f}s, rms={rms:.5f}, peak={peak:.5f})"
+                )
+                text = ""
 
             return TranscriptionResult(
                 text=text.strip(),
@@ -789,12 +853,26 @@ class ASRService:
                     device=self._device, dtype=self._dtype
                 )
 
+                whisper_generate_kwargs = {
+                    "language": language,
+                    "task": "transcribe",
+                    "temperature": 0.0,
+                    "condition_on_prev_tokens": False,
+                }
+
                 with torch.no_grad():
-                    predicted_ids = self._model.generate(
-                        input_features,
-                        language=language,
-                        task="transcribe",
-                    )
+                    try:
+                        predicted_ids = self._model.generate(
+                            input_features,
+                            **whisper_generate_kwargs,
+                        )
+                    except TypeError:
+                        # Keep compatibility with older transformers kwargs.
+                        predicted_ids = self._model.generate(
+                            input_features,
+                            language=language,
+                            task="transcribe",
+                        )
 
                 transcription = self._processor.batch_decode(
                     predicted_ids, skip_special_tokens=True

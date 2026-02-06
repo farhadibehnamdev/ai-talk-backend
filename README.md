@@ -185,6 +185,11 @@ cp env.example .env
 | `ASR_PREFER_MOSHI` | `true` | Prefer Moshi backend for Kyutai STT stability |
 | `ASR_ENABLE_KYUTAI_TRANSFORMERS` | `false` | Enable Kyutai STT via transformers backend |
 | `ASR_KYUTAI_ATTN_IMPLEMENTATION` | `eager` | Attention impl for Kyutai transformers backend |
+| `ASR_WHISPER_FALLBACK_MODEL` | `openai/whisper-large-v3` | Whisper fallback model when Kyutai fails |
+| `ASR_SILENCE_RMS_THRESHOLD` | `0.006` | Skip very weak decoded chunks |
+| `ASR_SILENCE_PEAK_THRESHOLD` | `0.08` | Skip low-peak decoded chunks |
+| `ASR_FILTER_NOISE_TRANSCRIPTS` | `true` | Drop weak short low-information transcripts |
+| `ASR_NOISE_MAX_DURATION_S` | `2.0` | Max duration for low-information filtering |
 | `TTS_MODEL_NAME` | `kyutai/tts-1.6b-en_fr` | TTS model |
 | `TTS_SAMPLE_RATE` | `24000` | Audio output sample rate |
 

@@ -81,6 +81,26 @@ class Settings(BaseSettings):
         default="eager",
         description="Attention implementation for Kyutai transformers backend (eager, sdpa, flash_attention_2)",
     )
+    asr_whisper_fallback_model: str = Field(
+        default="openai/whisper-large-v3",
+        description="Whisper model used when Kyutai STT backends are unavailable",
+    )
+    asr_silence_rms_threshold: float = Field(
+        default=0.006,
+        description="Minimum RMS for considering decoded audio as speech",
+    )
+    asr_silence_peak_threshold: float = Field(
+        default=0.08,
+        description="Minimum peak amplitude for considering decoded audio as speech",
+    )
+    asr_filter_noise_transcripts: bool = Field(
+        default=True,
+        description="Drop low-information transcripts from low-energy chunks (e.g., repeated 'you')",
+    )
+    asr_noise_max_duration_s: float = Field(
+        default=2.0,
+        description="Apply low-information noise transcript filter only for short chunks",
+    )
 
     # ===========================================
     # TTS (Text-to-Speech) Model Configuration
