@@ -193,8 +193,11 @@ async def conversation_endpoint(websocket: WebSocket):
         session = manager.get_session(session_id)
 
         # Audio buffer for accumulating chunks
+        # Note: Frontend may send encoded audio (Opus/WebM) not raw PCM.
+        # Encoded chunks are much smaller than raw PCM (~2KB vs ~16KB for 0.5s).
+        # Use a lower threshold to accommodate both formats.
         audio_buffer = b""
-        min_audio_length = 16000 * 2 * 0.5  # 0.5 seconds of audio (16kHz, 16-bit)
+        min_audio_length = 4000  # ~4KB works for both encoded (~2KB/chunk) and raw PCM
 
         while manager.is_connected(session_id):
             try:

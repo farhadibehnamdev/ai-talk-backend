@@ -294,46 +294,156 @@ class ASRService:
             self._is_loaded = False
             logger.info("ASR model unloaded")
 
-    def preprocess_audio(self, audio_bytes: bytes) -> np.ndarray:
+    def _is_encoded_audio(self, audio_bytes: bytes) -> bool:
         """
-        Preprocess audio bytes into the format expected by the model.
+        Detect if audio bytes are in an encoded container format (Opus/WebM/OGG)
+        rather than raw PCM.
+        """
+        if len(audio_bytes) < 4:
+            return False
+        # WebM/Matroska magic bytes
+        if audio_bytes[:4] == b"\x1a\x45\xdf\xa3":
+            return True
+        # OGG magic bytes
+        if audio_bytes[:4] == b"OggS":
+            return True
+        # RIFF/WAV
+        if audio_bytes[:4] == b"RIFF":
+            return True
+        # fLaC
+        if audio_bytes[:4] == b"fLaC":
+            return True
+        # Also detect by heuristic: if raw PCM int16 samples have extreme alternating
+        # values, it's likely encoded data misread as PCM
+        if len(audio_bytes) >= 40:
+            test_samples = np.frombuffer(audio_bytes[:40], dtype=np.int16)
+            # Check if successive samples have huge jumps (encoded data signature)
+            diffs = np.abs(np.diff(test_samples.astype(np.float32)))
+            avg_diff = np.mean(diffs)
+            if avg_diff > 20000:
+                logger.debug(
+                    f"Audio heuristic: avg_diff={avg_diff:.0f}, "
+                    f"likely encoded (not raw PCM)"
+                )
+                return True
+        return False
 
-        Args:
-            audio_bytes: Raw audio bytes (expected format: 16-bit PCM, mono)
+    def _decode_with_ffmpeg(self, audio_bytes: bytes) -> np.ndarray:
+        """
+        Decode encoded audio (Opus/WebM/OGG/etc.) to raw PCM using ffmpeg.
 
         Returns:
             Numpy array of audio samples normalized to [-1, 1]
         """
+        import subprocess
+
         try:
-            # Try to decode as raw PCM first (most common from WebSocket)
-            # Ensure even number of bytes for int16 decoding
+            # Use ffmpeg to convert any audio format to raw PCM 16-bit mono 16kHz
+            process = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i",
+                    "pipe:0",  # Read from stdin
+                    "-f",
+                    "s16le",  # Output raw PCM 16-bit little-endian
+                    "-acodec",
+                    "pcm_s16le",  # PCM codec
+                    "-ac",
+                    "1",  # Mono
+                    "-ar",
+                    str(self.sample_rate),  # Target sample rate
+                    "-v",
+                    "error",  # Suppress verbose output
+                    "pipe:1",  # Write to stdout
+                ],
+                input=audio_bytes,
+                capture_output=True,
+                timeout=10,
+            )
+
+            if process.returncode != 0:
+                stderr = process.stderr.decode("utf-8", errors="replace")
+                raise RuntimeError(f"ffmpeg failed: {stderr}")
+
+            pcm_bytes = process.stdout
+            if len(pcm_bytes) == 0:
+                logger.warning("ffmpeg produced empty output")
+                return np.array([], dtype=np.float32)
+
+            audio_array = np.frombuffer(pcm_bytes, dtype=np.int16)
+            audio_array = audio_array.astype(np.float32) / 32768.0
+
+            logger.debug(
+                f"ffmpeg decoded: {len(audio_bytes)} encoded bytes -> "
+                f"{len(audio_array)} samples ({len(audio_array) / self.sample_rate:.2f}s)"
+            )
+            return audio_array
+
+        except FileNotFoundError:
+            raise RuntimeError(
+                "ffmpeg not found. Install it with: apt-get install ffmpeg"
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("ffmpeg timed out decoding audio")
+
+    def preprocess_audio(self, audio_bytes: bytes) -> np.ndarray:
+        """
+        Preprocess audio bytes into the format expected by the model.
+
+        Supports both raw PCM (16-bit, mono) and encoded formats (Opus/WebM/OGG)
+        which are automatically decoded via ffmpeg.
+
+        Args:
+            audio_bytes: Audio bytes (raw PCM or encoded format)
+
+        Returns:
+            Numpy array of audio samples normalized to [-1, 1]
+        """
+        if len(audio_bytes) == 0:
+            return np.array([], dtype=np.float32)
+
+        # Step 1: Check if this is encoded audio (Opus/WebM/OGG) and decode it
+        if self._is_encoded_audio(audio_bytes):
+            logger.debug(
+                f"Detected encoded audio ({len(audio_bytes)} bytes), "
+                f"decoding with ffmpeg..."
+            )
+            try:
+                return self._decode_with_ffmpeg(audio_bytes)
+            except Exception as e:
+                logger.error(f"ffmpeg decode failed: {e}")
+                # Fall through to try other methods
+
+        # Step 2: Try as raw PCM 16-bit
+        try:
             if len(audio_bytes) % 2 != 0:
                 audio_bytes = audio_bytes[:-1]
             if len(audio_bytes) == 0:
                 return np.array([], dtype=np.float32)
             audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
-            # Normalize to [-1, 1]
             audio_array = audio_array.astype(np.float32) / 32768.0
             return audio_array
         except Exception:
-            # Try using soundfile for other formats (WAV, FLAC, etc.)
-            try:
-                import soundfile as sf
+            pass
 
-                audio_array, sr = sf.read(io.BytesIO(audio_bytes))
+        # Step 3: Try using soundfile for other formats (WAV, FLAC, etc.)
+        try:
+            import soundfile as sf
 
-                # Convert to mono if stereo
-                if len(audio_array.shape) > 1:
-                    audio_array = audio_array.mean(axis=1)
+            audio_array, sr = sf.read(io.BytesIO(audio_bytes))
 
-                # Resample if needed
-                if sr != self.sample_rate:
-                    audio_array = self._resample(audio_array, sr, self.sample_rate)
+            # Convert to mono if stereo
+            if len(audio_array.shape) > 1:
+                audio_array = audio_array.mean(axis=1)
 
-                return audio_array.astype(np.float32)
-            except Exception as e:
-                logger.error(f"Failed to preprocess audio: {e}")
-                raise ValueError(f"Could not process audio data: {e}") from e
+            # Resample if needed
+            if sr != self.sample_rate:
+                audio_array = self._resample(audio_array, sr, self.sample_rate)
+
+            return audio_array.astype(np.float32)
+        except Exception as e:
+            logger.error(f"Failed to preprocess audio: {e}")
+            raise ValueError(f"Could not process audio data: {e}") from e
 
     def _resample(self, audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
         """Resample audio to target sample rate."""
