@@ -107,21 +107,33 @@ class ConnectionManager:
             )
         return self.sessions[session_id]
 
-    async def send_json(self, session_id: str, data: dict) -> None:
-        """Send JSON data to a specific client."""
+    def is_connected(self, session_id: str) -> bool:
+        """Check if a session is still connected."""
+        return session_id in self.active_connections
+
+    async def send_json(self, session_id: str, data: dict) -> bool:
+        """Send JSON data to a specific client. Returns False if send failed."""
         if session_id in self.active_connections:
             try:
                 await self.active_connections[session_id].send_json(data)
+                return True
             except Exception as e:
                 logger.error(f"Failed to send JSON to {session_id}: {e}")
+                self.disconnect(session_id)
+                return False
+        return False
 
-    async def send_bytes(self, session_id: str, data: bytes) -> None:
-        """Send binary data to a specific client."""
+    async def send_bytes(self, session_id: str, data: bytes) -> bool:
+        """Send binary data to a specific client. Returns False if send failed."""
         if session_id in self.active_connections:
             try:
                 await self.active_connections[session_id].send_bytes(data)
+                return True
             except Exception as e:
                 logger.error(f"Failed to send bytes to {session_id}: {e}")
+                self.disconnect(session_id)
+                return False
+        return False
 
 
 # Global connection manager
@@ -179,10 +191,14 @@ async def conversation_endpoint(websocket: WebSocket):
         audio_buffer = b""
         min_audio_length = 16000 * 2 * 0.5  # 0.5 seconds of audio (16kHz, 16-bit)
 
-        while True:
+        while manager.is_connected(session_id):
             try:
                 # Receive message (can be binary or text)
                 message = await websocket.receive()
+
+                if message.get("type") == "websocket.disconnect":
+                    logger.info(f"Received disconnect message for {session_id}")
+                    break
 
                 if "bytes" in message:
                     # Binary message: audio data
@@ -269,11 +285,18 @@ async def conversation_endpoint(websocket: WebSocket):
                     {"type": MessageType.ERROR, "message": "Invalid JSON message"},
                 )
             except Exception as e:
-                logger.error(f"Error processing message from {session_id}: {e}")
-                await manager.send_json(
+                error_msg = str(e)
+                # Detect disconnect-related errors and stop the loop
+                if "disconnect" in error_msg.lower() or "close" in error_msg.lower():
+                    logger.info(f"Connection lost for {session_id}: {error_msg}")
+                    break
+                logger.error(f"Error processing message from {session_id}: {error_msg}")
+                if not await manager.send_json(
                     session_id,
-                    {"type": MessageType.ERROR, "message": str(e)},
-                )
+                    {"type": MessageType.ERROR, "message": error_msg},
+                ):
+                    # Send failed — connection is dead, stop the loop
+                    break
 
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected: {session_id}")
@@ -313,14 +336,15 @@ async def process_audio_turn(
             return
 
         # Send transcript to client
-        await manager.send_json(
+        if not await manager.send_json(
             session_id,
             {
                 "type": MessageType.TRANSCRIPT,
                 "text": transcript_result.text,
                 "is_final": transcript_result.is_final,
             },
-        )
+        ):
+            return
 
         # Add to conversation
         session.add_user_utterance(transcript_result.text)
@@ -331,17 +355,18 @@ async def process_audio_turn(
         full_response = ""
         async for token in llm_service.generate_stream(session.context):
             full_response += token
-            await manager.send_json(
+            if not await manager.send_json(
                 session_id,
                 {
                     "type": MessageType.AI_TEXT,
                     "text": token,
                     "is_complete": False,
                 },
-            )
+            ):
+                return
 
         # Send completion signal for text
-        await manager.send_json(
+        if not await manager.send_json(
             session_id,
             {
                 "type": MessageType.AI_TEXT,
@@ -349,7 +374,8 @@ async def process_audio_turn(
                 "is_complete": True,
                 "full_text": full_response,
             },
-        )
+        ):
+            return
 
         # Add AI response to conversation
         session.add_ai_response(full_response)
@@ -358,14 +384,16 @@ async def process_audio_turn(
         logger.debug(f"Generating TTS audio for {session_id}")
 
         # Signal audio stream starting
-        await manager.send_json(
+        if not await manager.send_json(
             session_id,
             {"type": "ai_audio_start", "sample_rate": tts_service.sample_rate},
-        )
+        ):
+            return
 
         # Stream audio chunks
         async for audio_chunk in tts_service.synthesize_stream(full_response):
-            await manager.send_bytes(session_id, audio_chunk.data)
+            if not await manager.send_bytes(session_id, audio_chunk.data):
+                return
 
         # Signal turn complete
         await manager.send_json(
@@ -377,13 +405,14 @@ async def process_audio_turn(
 
     except Exception as e:
         logger.error(f"Error in audio turn processing for {session_id}: {e}")
-        await manager.send_json(
-            session_id,
-            {
-                "type": MessageType.ERROR,
-                "message": f"Failed to process audio: {str(e)}",
-            },
-        )
+        if manager.is_connected(session_id):
+            await manager.send_json(
+                session_id,
+                {
+                    "type": MessageType.ERROR,
+                    "message": f"Failed to process audio: {str(e)}",
+                },
+            )
 
 
 async def send_analysis(
@@ -406,13 +435,14 @@ async def send_analysis(
         feedback = await analysis_service.analyze_conversation(session.user_utterances)
 
         # Send analysis to client
-        await manager.send_json(
+        if not await manager.send_json(
             session_id,
             {
                 "type": MessageType.ANALYSIS,
                 "data": feedback.to_dict(),
             },
-        )
+        ):
+            return
 
         logger.info(
             f"Analysis sent for {session_id}: "
@@ -421,13 +451,14 @@ async def send_analysis(
 
     except Exception as e:
         logger.error(f"Error generating analysis for {session_id}: {e}")
-        await manager.send_json(
-            session_id,
-            {
-                "type": MessageType.ERROR,
-                "message": f"Failed to generate analysis: {str(e)}",
-            },
-        )
+        if manager.is_connected(session_id):
+            await manager.send_json(
+                session_id,
+                {
+                    "type": MessageType.ERROR,
+                    "message": f"Failed to generate analysis: {str(e)}",
+                },
+            )
 
 
 @router.get("/health")
