@@ -481,9 +481,10 @@ class ASRService:
                 logger.warning(
                     "Processor returned empty output, converting audio array directly to tensor"
                 )
-                # Mimi codec expects 3D: (batch, channels, length)
+                # Mimi codec expects 3D: (batch, channels, length) in float32
+                # The codec's conv layers have float32 biases, so input must be float32
                 input_tensor = (
-                    torch.tensor(audio_array, dtype=self._dtype)
+                    torch.tensor(audio_array, dtype=torch.float32)
                     .unsqueeze(0)  # channel dim -> (1, length)
                     .unsqueeze(0)  # batch dim -> (1, 1, length)
                     .to(self._device)
