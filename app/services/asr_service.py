@@ -393,7 +393,10 @@ class ASRService:
             else:
                 return self._transcribe_moshi(audio_array)
         except Exception as e:
-            logger.error(f"Sync transcription failed: {e}")
+            logger.error(f"Sync transcription failed: {type(e).__name__}: {e!r}")
+            import traceback
+
+            logger.error(f"Sync transcription traceback:\n{traceback.format_exc()}")
             return ""
 
     def _transcribe_moshi(self, audio_array: np.ndarray) -> str:
@@ -471,7 +474,12 @@ class ASRService:
             return transcription[0] if transcription else ""
 
         except Exception as e:
-            logger.error(f"Transformers transcription failed: {e}")
+            logger.error(
+                f"Transformers transcription failed: {type(e).__name__}: {e!r}"
+            )
+            import traceback
+
+            logger.error(f"Transformers traceback:\n{traceback.format_exc()}")
             raise
 
     async def transcribe_stream(
