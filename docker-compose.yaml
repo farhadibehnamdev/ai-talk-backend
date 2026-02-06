@@ -1,7 +1,5 @@
 # AI-Talk Backend - Docker Compose
-# Run with: docker-compose up -d
-
-version: "3.8"
+# Run with: docker compose up -d
 
 services:
   ai-backend:
@@ -11,7 +9,10 @@ services:
     container_name: ai-talk-backend
     restart: unless-stopped
 
-    # GPU Support
+    # GPU Support — requires NVIDIA Container Toolkit:
+    #   apt-get install -y nvidia-container-toolkit
+    #   nvidia-ctk runtime configure --runtime=docker
+    #   systemctl restart docker
     deploy:
       resources:
         reservations:
@@ -25,14 +26,24 @@ services:
       - PORT=8000
       - ENVIRONMENT=${ENVIRONMENT:-production}
       - DEBUG=${DEBUG:-false}
+      # LLM (Qwen 2.5 7B AWQ 4-bit) — ~4-5 GB VRAM
       - LLM_MODEL_NAME=${LLM_MODEL_NAME:-Qwen/Qwen2.5-7B-Instruct-AWQ}
-      - LLM_GPU_MEMORY_UTILIZATION=${LLM_GPU_MEMORY_UTILIZATION:-0.6}
-      - ASR_MODEL_NAME=${ASR_MODEL_NAME:-kyutai/moshi-asr}
-      - TTS_MODEL_NAME=${TTS_MODEL_NAME:-kyutai/moshi-tts}
+      - LLM_GPU_MEMORY_UTILIZATION=${LLM_GPU_MEMORY_UTILIZATION:-0.35}
+      # ASR/STT — Kyutai STT 2.6B (~6-8 GB VRAM) or Whisper fallback (~1.5 GB)
+      # Use kyutai/stt-2.6b-en-trfs for Kyutai, or openai/whisper-medium for Whisper
+      - ASR_MODEL_NAME=${ASR_MODEL_NAME:-openai/whisper-medium}
+      - ASR_SAMPLE_RATE=${ASR_SAMPLE_RATE:-16000}
+      # TTS — Kyutai TTS (needs transformers >= 4.54) or Coqui/edge-tts fallback
+      - TTS_MODEL_NAME=${TTS_MODEL_NAME:-kyutai/tts-1.6b-en_fr}
+      - TTS_SAMPLE_RATE=${TTS_SAMPLE_RATE:-24000}
+      # Model loading
       - PRELOAD_MODELS=${PRELOAD_MODELS:-true}
+      - ENABLE_MEMORY_EFFICIENT_LOADING=${ENABLE_MEMORY_EFFICIENT_LOADING:-true}
       - MODELS_CACHE_DIR=/app/models
-      - CORS_ORIGINS=${CORS_ORIGINS:-https://your-frontend.vercel.app}
+      # CORS — set to your frontend URL
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # HuggingFace cache directories
       - HF_HOME=/app/models
       - TRANSFORMERS_CACHE=/app/models
 
@@ -40,6 +51,7 @@ services:
       - "${BACKEND_PORT:-8000}:8000"
 
     volumes:
+      # Persist downloaded models across container restarts
       - ai_models:/app/models
       - ai_logs:/app/logs
 
@@ -48,7 +60,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 120s
+      # Models take time to download and load on first run
+      start_period: 300s
 
 volumes:
   ai_models:
