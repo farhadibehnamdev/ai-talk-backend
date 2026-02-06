@@ -13,13 +13,18 @@ This module handles the WebSocket connection for the AI-Talk conversation flow:
 """
 
 import asyncio
+import io
 import json
+import struct
 import uuid
+import wave
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import List, Optional
 
+import numpy as np
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from loguru import logger
 
@@ -203,6 +208,10 @@ async def conversation_endpoint(websocket: WebSocket):
                 if "bytes" in message:
                     # Binary message: audio data
                     audio_data = message["bytes"]
+                    logger.debug(
+                        f"Received audio chunk from {session_id}: "
+                        f"{len(audio_data)} bytes"
+                    )
                     audio_buffer += audio_data
 
                     # Process when we have enough audio
@@ -328,6 +337,67 @@ async def process_audio_turn(
     try:
         # Step 1: ASR - Convert speech to text
         logger.debug(f"Processing {len(audio_data)} bytes of audio for {session_id}")
+
+        # --- Audio diagnostic logging ---
+        try:
+            # Interpret as raw 16-bit PCM mono
+            trimmed = audio_data if len(audio_data) % 2 == 0 else audio_data[:-1]
+            if len(trimmed) > 0:
+                samples = np.frombuffer(trimmed, dtype=np.int16).astype(np.float32)
+                duration_sec = len(samples) / 16000.0
+                rms = np.sqrt(np.mean(samples**2))
+                peak = np.max(np.abs(samples))
+                non_zero = np.count_nonzero(samples)
+                pct_non_zero = (
+                    (non_zero / len(samples)) * 100 if len(samples) > 0 else 0
+                )
+
+                logger.info(
+                    f"[AUDIO DIAG] session={session_id} | "
+                    f"bytes={len(audio_data)} | samples={len(samples)} | "
+                    f"duration={duration_sec:.2f}s | "
+                    f"RMS={rms:.1f} | peak={peak:.0f} | "
+                    f"non_zero={pct_non_zero:.1f}%"
+                )
+
+                if rms < 10:
+                    logger.warning(
+                        f"[AUDIO DIAG] Audio appears to be SILENCE or near-silent "
+                        f"(RMS={rms:.1f}). Mic might not be working or sending empty frames."
+                    )
+                elif rms > 30000:
+                    logger.warning(
+                        f"[AUDIO DIAG] Audio appears to be CLIPPING/NOISE "
+                        f"(RMS={rms:.1f}). Check audio encoding format."
+                    )
+                else:
+                    logger.info(
+                        f"[AUDIO DIAG] Audio levels look NORMAL (RMS={rms:.1f}). "
+                        f"Speech likely present."
+                    )
+
+                # Save first audio chunk as WAV for manual inspection (once per session)
+                debug_dir = Path("/tmp/audio_debug")
+                debug_file = debug_dir / f"{session_id}.wav"
+                if not debug_file.exists():
+                    try:
+                        debug_dir.mkdir(parents=True, exist_ok=True)
+                        with wave.open(str(debug_file), "wb") as wf:
+                            wf.setnchannels(1)
+                            wf.setsampwidth(2)  # 16-bit
+                            wf.setframerate(16000)
+                            wf.writeframes(trimmed)
+                        logger.info(
+                            f"[AUDIO DIAG] Saved debug WAV: {debug_file} "
+                            f"({duration_sec:.2f}s) — download and play to verify"
+                        )
+                    except Exception as wav_err:
+                        logger.debug(
+                            f"[AUDIO DIAG] Could not save debug WAV: {wav_err}"
+                        )
+        except Exception as diag_err:
+            logger.debug(f"[AUDIO DIAG] Diagnostic failed: {diag_err}")
+        # --- End audio diagnostics ---
 
         transcript_result = await asr_service.transcribe(audio_data)
 
