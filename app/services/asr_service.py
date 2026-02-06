@@ -62,7 +62,10 @@ class ASRService:
         self._use_transformers = False  # Flag to track which backend is used
 
         # Audio configuration
-        self.sample_rate = settings.asr_sample_rate  # 16000 Hz expected
+        self.sample_rate = settings.asr_sample_rate  # 16000 Hz default
+        self._model_sample_rate = (
+            None  # Set during model loading (e.g. 24000 for Kyutai)
+        )
         self.chunk_duration_ms = settings.audio_chunk_ms
         self.stream_delay_ms = settings.asr_stream_delay_ms  # 2500ms for 2.6b model
 
@@ -133,69 +136,72 @@ class ASRService:
         self._load_whisper_fallback()
 
     def _try_load_transformers(self) -> bool:
-        """Try loading with native transformers support (>= 4.53.0)."""
+        """Try loading Kyutai STT with native transformers support.
+
+        Based on official docs:
+        https://huggingface.co/docs/transformers/en/model_doc/kyutai_speech_to_text
+        """
         try:
-            import transformers
-            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor
+            from transformers import (
+                KyutaiSpeechToTextForConditionalGeneration,
+                KyutaiSpeechToTextProcessor,
+            )
+        except ImportError:
+            try:
+                import transformers
 
-            # Check transformers version
-            version = tuple(map(int, transformers.__version__.split(".")[:2]))
-            if version < (4, 53):
-                logger.info(
-                    f"Transformers {transformers.__version__} < 4.53.0, skipping native loading"
-                )
-                return False
+                version = tuple(map(int, transformers.__version__.split(".")[:2]))
+                if version < (4, 53):
+                    logger.info(
+                        f"Transformers {transformers.__version__} < 4.53.0, "
+                        f"KyutaiSpeechToText not available"
+                    )
+                    return False
+            except Exception:
+                pass
+            logger.debug(
+                "KyutaiSpeechToText classes not available in this transformers version"
+            )
+            return False
 
+        try:
             logger.info("Attempting to load Kyutai STT with native transformers...")
 
-            # For transformers >= 4.53.0, use the -trfs variant
+            # Determine the -trfs model variant
             model_name = self.model_name
             if not model_name.endswith("-trfs"):
-                # Try the transformers-native variant
-                trfs_model = model_name.replace("stt-", "stt-").rstrip("/") + "-trfs"
-                try:
-                    self._processor = AutoProcessor.from_pretrained(
-                        trfs_model,
-                        cache_dir=self.cache_dir,
-                        trust_remote_code=settings.trust_remote_code,
-                    )
-                    self._model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                        trfs_model,
-                        torch_dtype=self._dtype,
-                        cache_dir=self.cache_dir,
-                        trust_remote_code=settings.trust_remote_code,
-                    ).to(self._device)
-                    self._use_transformers = True
-                    logger.info(f"Loaded Kyutai STT with transformers: {trfs_model}")
-                    logger.info(f"  Processor type: {type(self._processor).__name__}")
-                    logger.info(f"  Model type: {type(self._model).__name__}")
-                    return True
-                except Exception as e:
-                    logger.debug(f"Could not load -trfs variant: {e}")
+                trfs_model = model_name.rstrip("/") + "-trfs"
+            else:
+                trfs_model = model_name
 
-            # Try loading original model with transformers
-            self._processor = AutoProcessor.from_pretrained(
-                model_name,
+            # Load processor — no extra params needed per official docs
+            logger.info(f"Loading Kyutai STT processor: {trfs_model}")
+            self._processor = KyutaiSpeechToTextProcessor.from_pretrained(
+                trfs_model,
                 cache_dir=self.cache_dir,
-                trust_remote_code=settings.trust_remote_code,
             )
-            self._model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                model_name,
-                torch_dtype=self._dtype,
+
+            # Load model with device_map and dtype="auto" per official docs
+            logger.info(f"Loading Kyutai STT model: {trfs_model}")
+            self._model = KyutaiSpeechToTextForConditionalGeneration.from_pretrained(
+                trfs_model,
+                device_map=self._device,
+                dtype="auto",
                 cache_dir=self.cache_dir,
-                trust_remote_code=settings.trust_remote_code,
-            ).to(self._device)
+            )
+
             self._use_transformers = True
-            logger.info(f"Loaded Kyutai STT with transformers: {model_name}")
+            # Kyutai STT expects 24kHz audio (Mimi codec sample rate)
+            self._model_sample_rate = 24000
+            logger.info(f"Loaded Kyutai STT with transformers: {trfs_model}")
             logger.info(f"  Processor type: {type(self._processor).__name__}")
             logger.info(f"  Model type: {type(self._model).__name__}")
+            logger.info(f"  Model device: {self._model.device}")
+            logger.info(f"  Model sample rate: {self._model_sample_rate} Hz")
             return True
 
-        except ImportError as e:
-            logger.debug(f"Transformers import error: {e}")
-            return False
         except Exception as e:
-            logger.debug(f"Failed to load with transformers: {e}")
+            logger.debug(f"Failed to load Kyutai STT with transformers: {e}")
             return False
 
     def _try_load_moshi(self) -> bool:
@@ -565,93 +571,117 @@ class ASRService:
             raise
 
     def _transcribe_transformers(self, audio_array: np.ndarray, language: str) -> str:
-        """Transcribe using transformers model (Kyutai or Whisper)."""
+        """Transcribe using transformers model (Kyutai STT or Whisper).
+
+        For Kyutai STT, follows the official HuggingFace docs:
+        https://huggingface.co/docs/transformers/en/model_doc/kyutai_speech_to_text
+        """
         try:
-            # Prepare input features
-            inputs = self._processor(
-                audio_array,
-                sampling_rate=self.sample_rate,
-                return_tensors="pt",
-            )
+            is_kyutai = "kyutai" in str(type(self._model)).lower()
+            is_whisper = "whisper" in str(type(self._model)).lower()
 
-            # Debug: log full processor output details
-            available_keys = list(inputs.keys())
-            logger.debug(
-                f"Processor output: type={type(inputs).__name__}, "
-                f"keys={available_keys}, "
-                f"data={getattr(inputs, 'data', 'N/A')}"
-            )
-
-            # Move inputs to device — different models use different key names
-            input_tensor = None
-            input_key = None
-
-            for key in [
-                "input_features",
-                "input_values",
-                "audio_values",
-                "pixel_values",
-            ]:
-                if key in inputs:
-                    input_tensor = inputs[key].to(
-                        device=self._device, dtype=self._dtype
+            # --- Kyutai STT path (official docs) ---
+            if is_kyutai:
+                # Resample to 24kHz if needed (Kyutai expects 24kHz)
+                model_sr = self._model_sample_rate or 24000
+                if self.sample_rate != model_sr:
+                    audio_array = self._resample(
+                        audio_array, self.sample_rate, model_sr
                     )
-                    input_key = key
-                    break
+                    logger.debug(
+                        f"Resampled audio from {self.sample_rate}Hz to {model_sr}Hz, "
+                        f"new length: {len(audio_array)} samples"
+                    )
 
-            # If processor returned empty keys, try converting audio directly
-            if input_tensor is None and len(available_keys) == 0:
-                logger.warning(
-                    "Processor returned empty output, converting audio array directly to tensor"
-                )
-                # Mimi codec expects 3D: (batch, channels, length) in float32
-                # The codec's conv layers have float32 biases, so input must be float32
-                input_tensor = (
-                    torch.tensor(audio_array, dtype=torch.float32)
-                    .unsqueeze(0)  # channel dim -> (1, length)
-                    .unsqueeze(0)  # batch dim -> (1, 1, length)
-                    .to(self._device)
-                )
-                input_key = "input_values"
+                # Processor call — per official docs, just pass the audio array
+                inputs = self._processor(audio_array)
 
-            if input_tensor is None:
-                raise ValueError(
-                    f"Processor returned unexpected keys: {available_keys}. "
-                    f"data={getattr(inputs, 'data', 'N/A')}. "
-                    "Expected 'input_features' or 'input_values'."
-                )
+                logger.debug(f"Kyutai processor output keys: {list(inputs.keys())}")
 
-            logger.debug(
-                f"Using input key '{input_key}', tensor shape: {input_tensor.shape}"
-            )
+                # Move inputs to model device
+                inputs.to(self._model.device)
 
-            with torch.no_grad():
                 # Generate transcription
-                if hasattr(self._model, "generate"):
-                    # Check if model supports language parameter (Whisper)
-                    generate_kwargs = {}
-                    if "whisper" in str(type(self._model)).lower():
-                        generate_kwargs = {
-                            "language": language,
-                            "task": "transcribe",
-                        }
+                with torch.no_grad():
+                    output_tokens = self._model.generate(**inputs)
 
-                    # Pass the tensor with the correct keyword for the model
-                    generate_kwargs[input_key] = input_tensor
+                # Decode tokens to text
+                transcription = self._processor.batch_decode(
+                    output_tokens, skip_special_tokens=True
+                )
+                return transcription[0] if transcription else ""
 
+            # --- Whisper path ---
+            elif is_whisper:
+                inputs = self._processor(
+                    audio_array,
+                    sampling_rate=self.sample_rate,
+                    return_tensors="pt",
+                )
+
+                logger.debug(f"Whisper processor output keys: {list(inputs.keys())}")
+
+                input_features = inputs.input_features.to(
+                    device=self._device, dtype=self._dtype
+                )
+
+                with torch.no_grad():
                     predicted_ids = self._model.generate(
-                        **generate_kwargs,
+                        input_features,
+                        language=language,
+                        task="transcribe",
                     )
-                else:
-                    # Direct forward pass for encoder-only models
-                    outputs = self._model(input_tensor)
-                    predicted_ids = outputs.logits.argmax(dim=-1)
 
-            # Decode tokens to text
-            transcription = self._processor.batch_decode(
-                predicted_ids, skip_special_tokens=True
-            )
-            return transcription[0] if transcription else ""
+                transcription = self._processor.batch_decode(
+                    predicted_ids, skip_special_tokens=True
+                )
+                return transcription[0] if transcription else ""
+
+            # --- Generic fallback path ---
+            else:
+                inputs = self._processor(
+                    audio_array,
+                    sampling_rate=self.sample_rate,
+                    return_tensors="pt",
+                )
+
+                available_keys = list(inputs.keys())
+                logger.debug(f"Generic processor output keys: {available_keys}")
+
+                # Find the input tensor
+                input_tensor = None
+                input_key = None
+                for key in ["input_features", "input_values", "audio_values"]:
+                    if key in inputs:
+                        input_tensor = inputs[key].to(
+                            device=self._device, dtype=self._dtype
+                        )
+                        input_key = key
+                        break
+
+                if input_tensor is None:
+                    raise ValueError(
+                        f"Processor returned unexpected keys: {available_keys}. "
+                        "Expected 'input_features' or 'input_values'."
+                    )
+
+                logger.debug(
+                    f"Using input key '{input_key}', tensor shape: {input_tensor.shape}"
+                )
+
+                with torch.no_grad():
+                    if hasattr(self._model, "generate"):
+                        predicted_ids = self._model.generate(
+                            **{input_key: input_tensor}
+                        )
+                    else:
+                        outputs = self._model(input_tensor)
+                        predicted_ids = outputs.logits.argmax(dim=-1)
+
+                transcription = self._processor.batch_decode(
+                    predicted_ids, skip_special_tokens=True
+                )
+                return transcription[0] if transcription else ""
 
         except Exception as e:
             logger.error(
