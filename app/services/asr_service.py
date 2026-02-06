@@ -112,6 +112,12 @@ class ASRService:
 
     def _load_model_sync(self) -> None:
         """Synchronous model loading (runs in thread pool)."""
+        # If the configured model is a Whisper model, load it directly
+        if "whisper" in self.model_name.lower():
+            logger.info(f"Whisper model configured: {self.model_name}")
+            self._load_whisper_fallback(model_name=self.model_name)
+            return
+
         # Try multiple loading strategies in order of preference
 
         # Strategy 1: Try native transformers (>= 4.53.0)
@@ -122,7 +128,7 @@ class ASRService:
         if self._try_load_moshi():
             return
 
-        # Strategy 3: Fallback to Whisper for development
+        # Strategy 3: Fallback to Whisper
         logger.warning("Primary ASR models not available, using Whisper fallback")
         self._load_whisper_fallback()
 
@@ -235,13 +241,14 @@ class ASRService:
             logger.debug(f"Failed to load with Moshi: {e}")
             return False
 
-    def _load_whisper_fallback(self) -> None:
-        """Load Whisper as a fallback ASR model for development."""
+    def _load_whisper_fallback(self, model_name: str = None) -> None:
+        """Load Whisper as a fallback ASR model."""
         try:
             from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
-            model_name = "openai/whisper-base"
-            logger.info(f"Loading Whisper fallback: {model_name}")
+            if model_name is None:
+                model_name = "openai/whisper-base"
+            logger.info(f"Loading Whisper model: {model_name}")
 
             self._processor = WhisperProcessor.from_pretrained(
                 model_name,
