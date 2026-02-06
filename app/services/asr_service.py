@@ -442,10 +442,23 @@ class ASRService:
                 return_tensors="pt",
             )
 
-            # Move inputs to device
-            input_features = inputs.input_features.to(
-                device=self._device, dtype=self._dtype
-            )
+            # Move inputs to device — different models use different key names
+            available_keys = list(inputs.keys())
+            logger.debug(f"Processor output keys: {available_keys}")
+
+            if "input_features" in inputs:
+                input_tensor = inputs.input_features.to(
+                    device=self._device, dtype=self._dtype
+                )
+            elif "input_values" in inputs:
+                input_tensor = inputs.input_values.to(
+                    device=self._device, dtype=self._dtype
+                )
+            else:
+                raise ValueError(
+                    f"Processor returned unexpected keys: {available_keys}. "
+                    "Expected 'input_features' or 'input_values'."
+                )
 
             with torch.no_grad():
                 # Generate transcription
@@ -458,13 +471,18 @@ class ASRService:
                             "task": "transcribe",
                         }
 
+                    # Pass the tensor with the correct keyword for the model
+                    if "input_features" in inputs:
+                        generate_kwargs["input_features"] = input_tensor
+                    else:
+                        generate_kwargs["input_values"] = input_tensor
+
                     predicted_ids = self._model.generate(
-                        input_features,
                         **generate_kwargs,
                     )
                 else:
                     # Direct forward pass for encoder-only models
-                    outputs = self._model(input_features)
+                    outputs = self._model(input_tensor)
                     predicted_ids = outputs.logits.argmax(dim=-1)
 
             # Decode tokens to text
