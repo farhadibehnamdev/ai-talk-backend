@@ -161,6 +161,8 @@ class ASRService:
                     ).to(self._device)
                     self._use_transformers = True
                     logger.info(f"Loaded Kyutai STT with transformers: {trfs_model}")
+                    logger.info(f"  Processor type: {type(self._processor).__name__}")
+                    logger.info(f"  Model type: {type(self._model).__name__}")
                     return True
                 except Exception as e:
                     logger.debug(f"Could not load -trfs variant: {e}")
@@ -179,6 +181,8 @@ class ASRService:
             ).to(self._device)
             self._use_transformers = True
             logger.info(f"Loaded Kyutai STT with transformers: {model_name}")
+            logger.info(f"  Processor type: {type(self._processor).__name__}")
+            logger.info(f"  Model type: {type(self._model).__name__}")
             return True
 
         except ImportError as e:
@@ -442,23 +446,53 @@ class ASRService:
                 return_tensors="pt",
             )
 
-            # Move inputs to device — different models use different key names
+            # Debug: log full processor output details
             available_keys = list(inputs.keys())
-            logger.debug(f"Processor output keys: {available_keys}")
+            logger.debug(
+                f"Processor output: type={type(inputs).__name__}, "
+                f"keys={available_keys}, "
+                f"data={getattr(inputs, 'data', 'N/A')}"
+            )
 
-            if "input_features" in inputs:
-                input_tensor = inputs.input_features.to(
-                    device=self._device, dtype=self._dtype
+            # Move inputs to device — different models use different key names
+            input_tensor = None
+            input_key = None
+
+            for key in [
+                "input_features",
+                "input_values",
+                "audio_values",
+                "pixel_values",
+            ]:
+                if key in inputs:
+                    input_tensor = inputs[key].to(
+                        device=self._device, dtype=self._dtype
+                    )
+                    input_key = key
+                    break
+
+            # If processor returned empty keys, try converting audio directly
+            if input_tensor is None and len(available_keys) == 0:
+                logger.warning(
+                    "Processor returned empty output, converting audio array directly to tensor"
                 )
-            elif "input_values" in inputs:
-                input_tensor = inputs.input_values.to(
-                    device=self._device, dtype=self._dtype
+                input_tensor = (
+                    torch.tensor(audio_array, dtype=self._dtype)
+                    .unsqueeze(0)
+                    .to(self._device)
                 )
-            else:
+                input_key = "input_values"
+
+            if input_tensor is None:
                 raise ValueError(
                     f"Processor returned unexpected keys: {available_keys}. "
+                    f"data={getattr(inputs, 'data', 'N/A')}. "
                     "Expected 'input_features' or 'input_values'."
                 )
+
+            logger.debug(
+                f"Using input key '{input_key}', tensor shape: {input_tensor.shape}"
+            )
 
             with torch.no_grad():
                 # Generate transcription
@@ -472,10 +506,7 @@ class ASRService:
                         }
 
                     # Pass the tensor with the correct keyword for the model
-                    if "input_features" in inputs:
-                        generate_kwargs["input_features"] = input_tensor
-                    else:
-                        generate_kwargs["input_values"] = input_tensor
+                    generate_kwargs[input_key] = input_tensor
 
                     predicted_ids = self._model.generate(
                         **generate_kwargs,
