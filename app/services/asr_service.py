@@ -314,7 +314,7 @@ class ASRService:
         """
         if len(audio_bytes) < 4:
             return False
-        # WebM/Matroska magic bytes (must be at start of valid WebM file)
+        # WebM/Matroska magic bytes
         if audio_bytes[:4] == b"\x1a\x45\xdf\xa3":
             return True
         # OGG magic bytes
@@ -340,15 +340,6 @@ class ASRService:
                 )
                 return True
         return False
-    
-    def _has_webm_header(self, audio_bytes: bytes) -> bool:
-        """
-        Check if audio bytes start with a valid WebM header.
-        This helps detect stale buffers that are missing the header.
-        """
-        if len(audio_bytes) < 4:
-            return False
-        return audio_bytes[:4] == b"\x1a\x45\xdf\xa3"
 
     def _decode_with_ffmpeg(self, audio_bytes: bytes) -> np.ndarray:
         """
@@ -426,42 +417,19 @@ class ASRService:
 
         # Step 1: Check if this is encoded audio (Opus/WebM/OGG) and decode it
         if self._is_encoded_audio(audio_bytes):
-            # Special handling for WebM: check if header is present
-            # If heuristic detected WebM but header is missing, it's likely a stale buffer
-            if not self._has_webm_header(audio_bytes) and len(audio_bytes) > 4:
-                # Check if heuristic detected it as encoded
-                test_samples = np.frombuffer(audio_bytes[:40], dtype=np.int16)
-                diffs = np.abs(np.diff(test_samples.astype(np.float32)))
-                avg_diff = np.mean(diffs)
-                if avg_diff > 20000:
-                    logger.warning(
-                        f"Detected encoded audio without WebM header "
-                        f"({len(audio_bytes)} bytes, avg_diff={avg_diff:.0f}). "
-                        f"This is likely a stale buffer fragment. Skipping."
-                    )
-                    return np.array([], dtype=np.float32)
-            
             logger.debug(
                 f"Detected encoded audio ({len(audio_bytes)} bytes), "
                 f"decoding with ffmpeg..."
             )
             try:
-                decoded = self._decode_with_ffmpeg(audio_bytes)
-                # Validate decoded audio
-                if len(decoded) == 0:
-                    logger.warning(
-                        "ffmpeg decoded audio is empty. "
-                        "This chunk may be missing the WebM header (stale buffer)."
-                    )
-                return decoded
+                return self._decode_with_ffmpeg(audio_bytes)
             except Exception as e:
                 logger.error(f"ffmpeg decode failed: {e}")
                 # Don't fall back to raw PCM — interpreting encoded data as PCM
                 # produces garbled noise that Whisper hallucinates on.
                 logger.warning(
                     "Encoded audio could not be decoded. "
-                    "This chunk may be missing the WebM header (stale buffer). "
-                    "Skipping this chunk."
+                    "This chunk may be missing the WebM header (stale buffer)."
                 )
                 return np.array([], dtype=np.float32)
 
@@ -529,21 +497,9 @@ class ASRService:
             # Preprocess audio
             audio_array = self.preprocess_audio(audio_bytes)
 
-            # Skip if audio is too short (less than 100ms) or empty
+            # Skip if audio is too short (less than 100ms)
             min_samples = int(self.sample_rate * 0.1)
-            if audio_array is None or len(audio_array) < min_samples:
-                logger.debug(
-                    f"Skipping transcription: audio too short "
-                    f"({len(audio_array) if audio_array is not None else 0} samples, "
-                    f"min={min_samples})"
-                )
-                return TranscriptionResult(
-                    text="", is_final=True, confidence=0.0, language=language
-                )
-
-            # Additional validation: check for invalid values
-            if not np.isfinite(audio_array).all():
-                logger.warning("Audio array contains invalid values (NaN/Inf), skipping")
+            if len(audio_array) < min_samples:
                 return TranscriptionResult(
                     text="", is_final=True, confidence=0.0, language=language
                 )
@@ -570,19 +526,6 @@ class ASRService:
     def _transcribe_sync(self, audio_array: np.ndarray, language: str) -> str:
         """Synchronous transcription (runs in thread pool)."""
         try:
-            # Defensive check: ensure audio_array is valid before processing
-            if audio_array is None or len(audio_array) == 0:
-                logger.warning("Empty audio array passed to transcription, skipping")
-                return ""
-            
-            # Additional validation: check for NaN or Inf values that could cause segfaults
-            if not np.isfinite(audio_array).all():
-                logger.warning("Audio array contains NaN or Inf values, skipping")
-                return ""
-            
-            # Ensure audio_array is contiguous and properly typed
-            audio_array = np.ascontiguousarray(audio_array, dtype=np.float32)
-            
             if self._use_transformers:
                 return self._transcribe_transformers(audio_array, language)
             else:
@@ -597,15 +540,6 @@ class ASRService:
     def _transcribe_moshi(self, audio_array: np.ndarray) -> str:
         """Transcribe using Moshi STT model."""
         try:
-            # Final validation before model inference
-            if audio_array is None or len(audio_array) == 0:
-                logger.warning("Empty audio array in Moshi transcription")
-                return ""
-            
-            if not np.isfinite(audio_array).all():
-                logger.warning("Invalid audio array (NaN/Inf) in Moshi transcription")
-                return ""
-            
             # Convert audio to tensor
             audio_tensor = (
                 torch.from_numpy(audio_array)
@@ -643,15 +577,6 @@ class ASRService:
         https://huggingface.co/docs/transformers/en/model_doc/kyutai_speech_to_text
         """
         try:
-            # Final validation before model inference
-            if audio_array is None or len(audio_array) == 0:
-                logger.warning("Empty audio array in transformers transcription")
-                return ""
-            
-            if not np.isfinite(audio_array).all():
-                logger.warning("Invalid audio array (NaN/Inf) in transformers transcription")
-                return ""
-            
             is_kyutai = "kyutai" in str(type(self._model)).lower()
             is_whisper = "whisper" in str(type(self._model)).lower()
 
