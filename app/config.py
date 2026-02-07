@@ -69,6 +69,46 @@ class Settings(BaseSettings):
         default=2500,
         description="STT streaming delay in milliseconds (2500 for 2.6b-en, 500 for 1b-en_fr)",
     )
+    asr_prefer_moshi: bool = Field(
+        default=True,
+        description="Prefer Moshi backend for Kyutai STT models (more stable on CUDA)",
+    )
+    asr_enable_kyutai_transformers: bool = Field(
+        default=False,
+        description="Enable Kyutai STT via transformers backend (disabled by default for stability)",
+    )
+    asr_kyutai_attn_implementation: str = Field(
+        default="eager",
+        description="Attention implementation for Kyutai transformers backend (eager, sdpa, flash_attention_2)",
+    )
+    asr_whisper_fallback_model: str = Field(
+        default="openai/whisper-large-v3",
+        description="Whisper model used when Kyutai STT backends are unavailable",
+    )
+    asr_silence_rms_threshold: float = Field(
+        default=0.006,
+        description="Minimum RMS for considering decoded audio as speech",
+    )
+    asr_silence_peak_threshold: float = Field(
+        default=0.08,
+        description="Minimum peak amplitude for considering decoded audio as speech",
+    )
+    asr_filter_noise_transcripts: bool = Field(
+        default=True,
+        description="Drop low-information transcripts from low-energy chunks (e.g., repeated 'you')",
+    )
+    asr_noise_max_duration_s: float = Field(
+        default=2.0,
+        description="Apply low-information noise transcript filter only for short chunks",
+    )
+    asr_drop_common_false_positives: bool = Field(
+        default=True,
+        description="Drop frequent standalone false-positive transcripts (e.g., 'you')",
+    )
+    asr_common_false_positive_words: str = Field(
+        default="you",
+        description="Comma-separated standalone words to drop as false positives",
+    )
 
     # ===========================================
     # TTS (Text-to-Speech) Model Configuration
@@ -154,6 +194,22 @@ class Settings(BaseSettings):
     )
     ws_ping_timeout: int = Field(
         default=10, description="WebSocket ping timeout in seconds"
+    )
+    ws_min_audio_buffer_bytes: int = Field(
+        default=24000,
+        description="Minimum buffered audio bytes before ASR turn processing",
+    )
+    ws_max_audio_buffer_bytes: int = Field(
+        default=160000,
+        description="Maximum buffered audio bytes before forcing ASR turn processing",
+    )
+    ws_speech_end_silence_ms: int = Field(
+        default=700,
+        description="Silence window in ms to detect end-of-user-turn",
+    )
+    ws_barge_in_min_bytes: int = Field(
+        default=24000,
+        description="Buffered bytes required during AI response to trigger interruption",
     )
 
     # ===========================================

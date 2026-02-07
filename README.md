@@ -182,8 +182,27 @@ cp env.example .env
 | `LLM_GPU_MEMORY_UTILIZATION` | `0.35` | GPU memory fraction for LLM |
 | `ASR_MODEL_NAME` | `kyutai/stt-2.6b-en` | STT model |
 | `ASR_SAMPLE_RATE` | `16000` | Audio input sample rate |
+| `ASR_PREFER_MOSHI` | `true` | Prefer Moshi backend for Kyutai STT stability |
+| `ASR_ENABLE_KYUTAI_TRANSFORMERS` | `false` | Enable Kyutai STT via transformers backend |
+| `ASR_KYUTAI_ATTN_IMPLEMENTATION` | `eager` | Attention impl for Kyutai transformers backend |
+| `ASR_WHISPER_FALLBACK_MODEL` | `openai/whisper-large-v3` | Whisper fallback model when Kyutai fails |
+| `ASR_SILENCE_RMS_THRESHOLD` | `0.006` | Skip very weak decoded chunks |
+| `ASR_SILENCE_PEAK_THRESHOLD` | `0.08` | Skip low-peak decoded chunks |
+| `ASR_FILTER_NOISE_TRANSCRIPTS` | `true` | Drop weak short low-information transcripts |
+| `ASR_NOISE_MAX_DURATION_S` | `2.0` | Max duration for low-information filtering |
+| `ASR_DROP_COMMON_FALSE_POSITIVES` | `true` | Drop common one-word false positives |
+| `ASR_COMMON_FALSE_POSITIVE_WORDS` | `you` | Comma-separated words to suppress |
 | `TTS_MODEL_NAME` | `kyutai/tts-1.6b-en_fr` | TTS model |
 | `TTS_SAMPLE_RATE` | `24000` | Audio output sample rate |
+
+#### WebSocket Turn Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `WS_MIN_AUDIO_BUFFER_BYTES` | `24000` | Minimum buffered bytes before turn processing |
+| `WS_MAX_AUDIO_BUFFER_BYTES` | `160000` | Force processing when buffer grows too large |
+| `WS_SPEECH_END_SILENCE_MS` | `700` | Silence window to detect end of speech |
+| `WS_BARGE_IN_MIN_BYTES` | `24000` | Audio bytes needed during AI speech to interrupt |
 
 #### Memory Management
 

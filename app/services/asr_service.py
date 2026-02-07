@@ -14,6 +14,7 @@ Model: https://huggingface.co/kyutai/stt-2.6b-en
 
 import asyncio
 import io
+import re
 from dataclasses import dataclass
 from typing import AsyncGenerator, Optional
 
@@ -72,6 +73,20 @@ class ASRService:
         # Model configuration
         self.model_name = settings.asr_model_name
         self.cache_dir = settings.models_cache_dir
+        self._prefer_moshi = settings.asr_prefer_moshi
+        self._enable_kyutai_transformers = settings.asr_enable_kyutai_transformers
+        self._kyutai_attn_implementation = settings.asr_kyutai_attn_implementation
+        self._whisper_fallback_model = settings.asr_whisper_fallback_model
+        self._silence_rms_threshold = settings.asr_silence_rms_threshold
+        self._silence_peak_threshold = settings.asr_silence_peak_threshold
+        self._filter_noise_transcripts = settings.asr_filter_noise_transcripts
+        self._noise_max_duration_s = settings.asr_noise_max_duration_s
+        self._drop_common_false_positives = settings.asr_drop_common_false_positives
+        self._common_false_positive_words = {
+            w.strip().lower()
+            for w in settings.asr_common_false_positive_words.split(",")
+            if w.strip()
+        }
 
     @property
     def is_loaded(self) -> bool:
@@ -115,32 +130,60 @@ class ASRService:
 
     def _load_model_sync(self) -> None:
         """Synchronous model loading (runs in thread pool)."""
+        model_name_lower = self.model_name.lower()
+
         # If the configured model is a Whisper model, load it directly
-        if "whisper" in self.model_name.lower():
+        if "whisper" in model_name_lower:
             logger.info(f"Whisper model configured: {self.model_name}")
             self._load_whisper_fallback(model_name=self.model_name)
             return
 
-        # Try multiple loading strategies in order of preference
+        is_kyutai_model = "kyutai" in model_name_lower
 
-        # Strategy 1: Try native transformers (>= 4.53.0)
+        # Kyutai model loading strategy:
+        # 1. Moshi by default (more stable in mixed CUDA stacks)
+        # 2. Transformers only when explicitly enabled
+        # 3. Whisper fallback
+        if is_kyutai_model:
+            if self._prefer_moshi and self._try_load_moshi():
+                return
+
+            if self._enable_kyutai_transformers and self._try_load_transformers():
+                return
+
+            if not self._prefer_moshi and self._try_load_moshi():
+                return
+
+            if not self._enable_kyutai_transformers:
+                logger.warning(
+                    "Kyutai transformers backend is disabled "
+                    "(ASR_ENABLE_KYUTAI_TRANSFORMERS=false). "
+                    "Falling back to Whisper for stability."
+                )
+            else:
+                logger.warning(
+                    "Kyutai STT backends failed (Moshi/transformers). "
+                    "Falling back to Whisper."
+                )
+
+            self._load_whisper_fallback()
+            return
+
+        # Non-Kyutai strategy:
+        # 1. Transformers
+        # 2. Moshi
+        # 3. Whisper fallback
         if self._try_load_transformers():
             return
 
-        # Strategy 2: Try Moshi library
         if self._try_load_moshi():
             return
 
-        # Strategy 3: Fallback to Whisper
         logger.warning("Primary ASR models not available, using Whisper fallback")
         self._load_whisper_fallback()
 
     def _try_load_transformers(self) -> bool:
-        """Try loading Kyutai STT with native transformers support.
-
-        Based on official docs:
-        https://huggingface.co/docs/transformers/en/model_doc/kyutai_speech_to_text
-        """
+        """Try loading Kyutai STT with native transformers support."""
         try:
             from transformers import (
                 KyutaiSpeechToTextForConditionalGeneration,
@@ -167,31 +210,62 @@ class ASRService:
         try:
             logger.info("Attempting to load Kyutai STT with native transformers...")
 
-            # Determine the -trfs model variant
             model_name = self.model_name
-            if not model_name.endswith("-trfs"):
-                trfs_model = model_name.rstrip("/") + "-trfs"
-            else:
-                trfs_model = model_name
+            trfs_model = (
+                model_name.rstrip("/") + "-trfs"
+                if not model_name.endswith("-trfs")
+                else model_name
+            )
 
-            # Load processor — no extra params needed per official docs
             logger.info(f"Loading Kyutai STT processor: {trfs_model}")
             self._processor = KyutaiSpeechToTextProcessor.from_pretrained(
                 trfs_model,
                 cache_dir=self.cache_dir,
             )
 
-            # Load model with device_map and dtype="auto" per official docs
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+
+            attn_impl = (self._kyutai_attn_implementation or "eager").strip().lower()
+            if attn_impl not in {"eager", "sdpa", "flash_attention_2"}:
+                logger.warning(
+                    f"Invalid ASR_KYUTAI_ATTN_IMPLEMENTATION='{attn_impl}', using 'eager'"
+                )
+                attn_impl = "eager"
+
+            load_kwargs = {
+                "cache_dir": self.cache_dir,
+                "trust_remote_code": settings.trust_remote_code,
+                "attn_implementation": attn_impl,
+            }
+            if self._device and self._device.type == "cuda":
+                load_kwargs["device_map"] = "auto"
+                load_kwargs["torch_dtype"] = self._dtype
+            else:
+                load_kwargs["torch_dtype"] = torch.float32
+
             logger.info(f"Loading Kyutai STT model: {trfs_model}")
             self._model = KyutaiSpeechToTextForConditionalGeneration.from_pretrained(
                 trfs_model,
-                device_map=self._device,
-                dtype="auto",
-                cache_dir=self.cache_dir,
+                **load_kwargs,
             )
+            if self._device and self._device.type != "cuda":
+                self._model = self._model.to(self._device)
+
+            if hasattr(self._model, "generation_config"):
+                cache_impl = getattr(
+                    self._model.generation_config, "cache_implementation", None
+                )
+                if cache_impl == "sliding_window":
+                    self._model.generation_config.cache_implementation = "static"
+                    logger.info(
+                        "ASR generation cache changed: "
+                        "sliding_window -> static (stability mode)"
+                    )
 
             self._use_transformers = True
-            # Kyutai STT expects 24kHz audio (Mimi codec sample rate)
             self._model_sample_rate = 24000
             logger.info(f"Loaded Kyutai STT with transformers: {trfs_model}")
             logger.info(f"  Processor type: {type(self._processor).__name__}")
@@ -253,7 +327,7 @@ class ASRService:
             from transformers import WhisperForConditionalGeneration, WhisperProcessor
 
             if model_name is None:
-                model_name = "openai/whisper-base"
+                model_name = self._whisper_fallback_model
             logger.info(f"Loading Whisper model: {model_name}")
 
             self._processor = WhisperProcessor.from_pretrained(
@@ -267,6 +341,7 @@ class ASRService:
             ).to(self._device)
 
             self._use_transformers = True
+            self._model_sample_rate = 16000
             logger.info("Loaded Whisper fallback model for ASR")
 
         except Exception as e:
@@ -477,6 +552,39 @@ class ASRService:
             indices = np.linspace(0, len(audio) - 1, target_length)
             return np.interp(indices, np.arange(len(audio)), audio)
 
+    def _compute_audio_stats(self, audio_array: np.ndarray) -> tuple[float, float, float]:
+        """Return duration (s), RMS, and peak for normalized audio."""
+        if audio_array is None or len(audio_array) == 0:
+            return 0.0, 0.0, 0.0
+        duration_sec = len(audio_array) / float(self.sample_rate)
+        rms = float(np.sqrt(np.mean(np.square(audio_array, dtype=np.float32))))
+        peak = float(np.max(np.abs(audio_array)))
+        return duration_sec, rms, peak
+
+    def _is_low_energy_audio(self, audio_array: np.ndarray) -> bool:
+        """Detect likely non-speech chunks based on decoded waveform energy."""
+        _, rms, peak = self._compute_audio_stats(audio_array)
+        return rms < self._silence_rms_threshold and peak < self._silence_peak_threshold
+
+    def _is_low_information_text(self, text: str) -> bool:
+        """Detect common short hallucination patterns from low-energy audio."""
+        normalized = re.sub(r"\s+", " ", text.strip().lower())
+        normalized = re.sub(r"[^a-z0-9' ]", "", normalized).strip()
+        if not normalized:
+            return True
+
+        words = normalized.split()
+        if not words:
+            return True
+
+        if len(words) == 1 and words[0] in {"you", "yeah", "uh", "um", "hmm", "mm"}:
+            return True
+
+        if len(words) <= 3 and len(set(words)) == 1:
+            return True
+
+        return False
+
     async def transcribe(
         self, audio_bytes: bytes, language: str = "en"
     ) -> TranscriptionResult:
@@ -504,11 +612,46 @@ class ASRService:
                     text="", is_final=True, confidence=0.0, language=language
                 )
 
+            duration_sec, rms, peak = self._compute_audio_stats(audio_array)
+            low_energy = self._is_low_energy_audio(audio_array)
+            if low_energy:
+                logger.debug(
+                    f"Skipping transcription: low-energy audio "
+                    f"(duration={duration_sec:.2f}s, rms={rms:.5f}, peak={peak:.5f})"
+                )
+                return TranscriptionResult(
+                    text="", is_final=True, confidence=0.0, language=language
+                )
+
             # Run transcription in thread pool
             loop = asyncio.get_event_loop()
             text = await loop.run_in_executor(
                 None, self._transcribe_sync, audio_array, language
             )
+
+            # Hard filter for common standalone false positives (e.g. repeated "you").
+            if self._drop_common_false_positives and duration_sec <= self._noise_max_duration_s:
+                normalized = re.sub(r"\s+", " ", text.strip().lower())
+                normalized = re.sub(r"[^a-z0-9' ]", "", normalized).strip()
+                if normalized in self._common_false_positive_words:
+                    logger.info(
+                        f"Dropping common false-positive transcript: '{text.strip()}' "
+                        f"(duration={duration_sec:.2f}s)"
+                    )
+                    text = ""
+
+            # Filter typical short hallucinations from weak/short chunks (e.g. "you")
+            if (
+                self._filter_noise_transcripts
+                and duration_sec <= self._noise_max_duration_s
+                and rms < (self._silence_rms_threshold * 2.0)
+                and self._is_low_information_text(text)
+            ):
+                logger.info(
+                    f"Dropping likely noise transcript: '{text.strip()}' "
+                    f"(duration={duration_sec:.2f}s, rms={rms:.5f}, peak={peak:.5f})"
+                )
+                text = ""
 
             return TranscriptionResult(
                 text=text.strip(),
@@ -570,6 +713,23 @@ class ASRService:
             logger.error(f"Moshi transcription failed: {e}")
             raise
 
+    def _get_model_input_device(self) -> torch.device:
+        """Resolve a stable device for model inputs."""
+        hf_device_map = getattr(self._model, "hf_device_map", None)
+        if isinstance(hf_device_map, dict) and hf_device_map:
+            for mapped in hf_device_map.values():
+                if mapped in {"cpu", "meta", "disk"}:
+                    continue
+                if isinstance(mapped, int):
+                    return torch.device(f"cuda:{mapped}")
+                if isinstance(mapped, str) and mapped.startswith("cuda"):
+                    return torch.device(mapped)
+
+        try:
+            return next(self._model.parameters()).device
+        except Exception:
+            return self._device if self._device is not None else torch.device("cpu")
+
     def _transcribe_transformers(self, audio_array: np.ndarray, language: str) -> str:
         """Transcribe using transformers model (Kyutai STT or Whisper).
 
@@ -593,17 +753,27 @@ class ASRService:
                         f"new length: {len(audio_array)} samples"
                     )
 
-                # Processor call — per official docs, just pass the audio array
+                # Processor call per official docs: pass the audio array.
                 inputs = self._processor(audio=audio_array)
 
                 logger.debug(f"Kyutai processor output keys: {list(inputs.keys())}")
 
-                # Move inputs to model device
-                inputs.to(self._model.device)
+                # For sharded models, use the first CUDA shard as input device.
+                input_device = self._get_model_input_device()
+                inputs = inputs.to(input_device)
 
                 # Generate transcription
+                generate_kwargs = {}
+                cache_impl = None
+                if hasattr(self._model, "generation_config"):
+                    cache_impl = getattr(
+                        self._model.generation_config, "cache_implementation", None
+                    )
+                if cache_impl in {None, "sliding_window"}:
+                    generate_kwargs["cache_implementation"] = "static"
+
                 with torch.no_grad():
-                    output_tokens = self._model.generate(**inputs)
+                    output_tokens = self._model.generate(**inputs, **generate_kwargs)
 
                 # Decode tokens to text
                 transcription = self._processor.batch_decode(
@@ -625,12 +795,26 @@ class ASRService:
                     device=self._device, dtype=self._dtype
                 )
 
+                whisper_generate_kwargs = {
+                    "language": language,
+                    "task": "transcribe",
+                    "temperature": 0.0,
+                    "condition_on_prev_tokens": False,
+                }
+
                 with torch.no_grad():
-                    predicted_ids = self._model.generate(
-                        input_features,
-                        language=language,
-                        task="transcribe",
-                    )
+                    try:
+                        predicted_ids = self._model.generate(
+                            input_features,
+                            **whisper_generate_kwargs,
+                        )
+                    except TypeError:
+                        # Keep compatibility with older transformers kwargs.
+                        predicted_ids = self._model.generate(
+                            input_features,
+                            language=language,
+                            task="transcribe",
+                        )
 
                 transcription = self._processor.batch_decode(
                     predicted_ids, skip_special_tokens=True
